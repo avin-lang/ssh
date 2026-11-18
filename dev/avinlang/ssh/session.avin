@@ -1,0 +1,241 @@
+module dev.avinlang.ssh
+
+// A session: one SSH connection to a server, its host key checked, logged in, running commands.
+import avin.io
+import avin.io.IoError
+import avin.net.TcpStream
+import avin.threads.withTimeout
+import avin.time.Duration
+
+// How a session connects, what it trusts and how long it waits.
+data Options(
+  // How long the TCP connection, the SSH handshake and the host key's check may take together; none
+  // where `None`. The calling thread's own deadline, from `withTimeout` or `withDeadline`, bounds
+  // them too.
+  connectTimeout: Option[Duration] = None,
+  // How long any one wait for the server may last once connected; none where `None`. A wait that runs
+  // out answers `TimedOut` and leaves the session unusable.
+  timeout: Option[Duration] = None,
+  // What host key to trust.
+  hostKeys: HostKeys = Strict,
+  // The known-hosts file; `~/.ssh/known_hosts` where `None`.
+  knownHosts: Option[string] = None,
+  // How often to send the server a keepalive while the session waits on it, in whole seconds, at
+  // least two; none where `None`.
+  keepalive: Option[Duration] = None,
+  // How long `close` waits for the server to acknowledge each channel it closes, and the goodbye.
+  closeTimeout: Duration = 5.seconds
+)
+
+// What a session does with a command's standard error.
+data StderrMode
+  // Its own stream, read as `Stderr` chunks.
+  Separate
+  // Into standard output, read as `Stdout` chunks.
+  Merge
+  // Dropped.
+  Discard
+
+// An SSH session: a connection to one server, its host key checked by the options' `HostKeys`,
+// authenticated by one of the `auth` methods, then running commands (`exec`, `run`) on channels of
+// its own. Several commands may run on one session at once, each read in turn.
+//
+// A session belongs to the thread that made it, as every handle does, and so does every command it
+// runs: libssh2 lets one thread at a time use a session, and every operation first checks the
+// session's owner, so code that handed the session or a command of it to another thread traps where
+// it uses them again. Many sessions run at once on lightweight threads, one each: every wait for the
+// server parks only its own thread, and is a cancellation point.
+//
+// `close()` closes every command still open first, then says goodbye to the server; a command used
+// after its session was closed answers `Closed`. A session nothing reaches and nothing closed is
+// given back by the collector, its commands first.
+class Session(private val link: Link): io.Close
+  // The host and the port connected to, as given.
+  host -> string = link.host
+  port -> int = link.port
+
+  // Whether the session can be used: open, and no operation of it stopped part-way.
+  isOpen -> bool = link.isOpen
+
+  // Whether the server has accepted a login.
+  isAuthenticated -> bool = !link.closed && link.raw.authenticated()
+
+  // The SHA-256 fingerprint of the server's host key, as `ssh-keygen -l` writes it.
+  hostKeyFingerprint() -> Result[string, SshError]
+    link.usable()?
+    link.raw.hostKeyHash(hashSha256) match
+      Some(v) -> Ok(fingerprintOf(v.copy()))
+      None -> Err(Closed)
+
+  // The server's SSH banner, `SSH-2.0-OpenSSH_9.8` for one.
+  serverBanner() -> Result[string, SshError]
+    link.usable()?
+    Ok(link.raw.banner().getOrElse(""))
+
+  // The authentication methods the server offers `user` (`publickey`, `password`,
+  // `keyboard-interactive`); empty where the server let the user in with none.
+  authMethods(user: string) -> Result[Vector[string], SshError]
+    link.usable()?
+    noNul(user, "user name")?
+    link.methodsFor(user)
+
+  // Logs in as `user` with the private key in the file `privateKey`, locked with `passphrase` where it
+  // is; the public key is derived from it. `KeyFile` where the file cannot be read or the passphrase
+  // is wrong, `AuthFailed` where the server refuses the key.
+  authKey(user: string, privateKey: string, passphrase: Option[string] = None) -> Result[unit, SshError]
+    link.usable()?
+    noNul(user, "user name")?
+    noNul(privateKey, "key path")?
+    if passphrase.exists(p -> p.contains("\u0000")) then return Err(Invalid("the passphrase holds U+0000"))
+    val methods = link.methodsFor(user)?
+    if link.raw.authenticated() then return Ok(())
+    if !methods.contains("publickey") then return Err(AuthFailed("publickey", methods))
+    val rc = link.retrying(
+      "log in with a key",
+      () -> link.raw.authKeyFile(user, long(user.byteLength), None, privateKey, passphrase)
+    )?
+    if rc == 0 then Ok(()) else Err(link.authFailure(rc, "publickey", privateKey))
+
+  // Logs in as `user` with `password`. `AuthFailed` where the server refuses it or takes no passwords.
+  authPassword(user: string, password: string) -> Result[unit, SshError]
+    link.usable()?
+    noNul(user, "user name")?
+    if password.contains("\u0000") then return Err(Invalid("the password holds U+0000"))
+    val methods = link.methodsFor(user)?
+    if link.raw.authenticated() then return Ok(())
+    if !methods.contains("password") then return Err(AuthFailed("password", methods))
+    val rc = link.retrying(
+      "log in with a password",
+      () -> link.raw.authPassword(user, long(user.byteLength), password, long(password.byteLength))
+    )?
+    if rc == 0 then Ok(()) else Err(link.authFailure(rc, "password", ""))
+
+  // Logs in as `user` with a key the SSH agent holds, trying each in turn until the server takes one.
+  // The agent is the one `SSH_AUTH_SOCK` names, or the one listening at `socket`. `Agent` where the
+  // agent cannot be reached or holds no key, `AuthFailed` where the server takes none of its keys.
+  authAgent(user: string, socket: Option[string] = None) -> Result[unit, SshError]
+    link.usable()?
+    noNul(user, "user name")?
+    if socket.exists(p -> p.contains("\u0000")) then return Err(Invalid("the agent's socket path holds U+0000"))
+    val methods = link.methodsFor(user)?
+    if link.raw.authenticated() then return Ok(())
+    if !methods.contains("publickey") then return Err(AuthFailed("publickey", methods))
+    val agent = link.raw.agent() match
+      Some(a) -> a
+      None -> return Err(Agent("libssh2 could not make a connection to an agent"))
+    defer _ = agent.close()
+    socket.foreach(p -> agent.setPath(p))
+    if agent.connect() != 0 then return Err(Agent("cannot connect to the agent"))
+    if agent.listIdentities() != 0 then return Err(Agent("the agent would not list its keys"))
+    var prev: Option[AgentKey] = None
+    var tried = 0
+    loop
+      val (rc, next) = agent.identity(prev)
+      if rc != 0 then break
+      val key = next match
+        Some(k) -> k
+        None -> break
+      tried += 1
+      val answer = link.retrying("log in with the agent", () -> agent.userauth(user, key))?
+      if answer == 0 then return Ok(())
+      if answer != authenticationFailed && answer != publickeyUnverified
+        return Err(link.authFailure(answer, "agent", ""))
+      prev = Some(key)
+    if tried == 0 then Err(Agent("the agent holds no keys")) else Err(AuthFailed("agent", methods))
+
+  // Starts `command` on a channel of its own and answers the running command, to read its output and
+  // exit status from and write its input to. `stderr` says what becomes of its standard error.
+  exec(command: string, stderr: StderrMode = Separate) -> Result[Exec, SshError]
+    link.usable()?
+    noNul(command, "command")?
+    val ch = link.channel()?
+    var started = false
+    defer
+      if !started then link.retire(ch)
+    val mode = stderr match
+      Separate -> -1
+      Merge -> extendedMerge
+      Discard -> extendedIgnore
+    if mode >= 0
+      val rc = link.retrying("start the command", () -> ch.extendedData(mode))?
+      if rc < 0 then return Err(link.failure(rc, "start the command"))
+    val rc = link.retrying("start the command", () -> ch.startup("exec", 4, command, long(command.byteLength)))?
+    if rc < 0 then return Err(link.failure(rc, "start the command"))
+    started = true
+    link.channels.addOne(ch)
+    Ok(Exec(link, ch, stderr))
+
+  // Runs `command` to its end and answers its exit status and output: at most `limit` bytes of each of
+  // standard output and standard error, the rest read and dropped, `truncated` saying whether any was.
+  run(command: string, limit: int = 16777216) -> Result[Output, SshError]
+    if limit < 0 then return Err(Invalid(s"a limit of $limit bytes"))
+    val e = exec(command)?
+    defer _ = e.close()
+    val out = Buffer[byte]()
+    val err = Buffer[byte]()
+    var truncated = false
+    loop
+      e.next()? match
+        Some(Stdout(bytes)) -> truncated = kept(out, bytes, limit) || truncated
+        Some(Stderr(bytes)) -> truncated = kept(err, bytes, limit) || truncated
+        None -> break
+    val status = e.wait()?
+    Ok(Output(status, out.toArray(), err.toArray(), truncated))
+
+  // Closes every command still open, tells the server goodbye and gives the connection back. Closing
+  // again does nothing. Waits at most the options' `closeTimeout` for each acknowledgement, and not at
+  // all on a session that was interrupted.
+  override close() -> Result[unit, IoError]
+    link.close()
+    Ok(())
+
+object Session
+  // A session with `host` at `port`, its host key checked as `options.hostKeys` says, not yet logged
+  // in. `Connect` where the connection cannot be made in time, `Handshake` where the two ends cannot
+  // agree, and one of the host key errors where the key is not trusted.
+  connect(host: string, port: int = 22, options: Options = Options()) -> Result[Session, SshError]
+    val init = ready()
+    if init != 0 then return Err(Failed(init, "libssh2 could not be initialized"))
+    noNul(host, "host")?
+    options.connectTimeout match
+      Some(d) if d.micros > 0 -> withTimeout(d, _ -> opened(host, port, options)) match
+        Some(r) -> r
+        None -> Err(Connect(IoError(io.TimedOut, "connect to", s"$host:$port")))
+      _ -> opened(host, port, options)
+
+  // The session, connected, shaken hands with and checked.
+  private opened(host: string, port: int, options: Options) -> Result[Session, SshError]
+    val tcp = TcpStream.connect(host, port).mapErr(e -> Connect(e))?
+    val fd = dupRaw(tcp.readinessDescriptor())
+    _ = tcp.close()
+    val sock = fd match
+      Ok(n) -> n
+      Err(e) -> return Err(Connect(IoError(io.Other(e.message), "connect to", s"$host:$port")))
+    val raw = sessionInit() match
+      Some(r) -> r
+      None ->
+        _ = closeRaw(sock)
+        return Err(Failed(0, "libssh2 could not make a session"))
+    raw.setBlocking(0)
+    val link = Link(raw, Socket(sock), host, port, options)
+    var done = false
+    defer
+      if !done then link.abandon()
+    link.handshake()?
+    verifyHostKey(raw, host, port, options.hostKeys, options.knownHosts.getOrElse(defaultKnownHosts()))?
+    options.keepalive.foreach(d -> raw.keepaliveConfig(1, if d.micros < 2000000 then 2 else d.micros / 1000000))
+    done = true
+    Ok(Session(link))
+
+// Fails with `Invalid` where `text` holds U+0000, which C would read as its end.
+private noNul(text: string, what: string) -> Result[unit, SshError] =
+  if text.contains("\u0000") then Err(Invalid(s"the $what holds U+0000")) else Ok(())
+
+// Adds what of `bytes` fits under `limit` to `into`, and answers whether any was left out.
+private kept(into: Buffer[byte], bytes: Array[byte], limit: int) -> bool
+  val room = limit - into.length
+  if bytes.length <= room
+    into.addAll(bytes)
+    return false
+  if room > 0 then into.addAll(bytes.slice(0, room))
+  true

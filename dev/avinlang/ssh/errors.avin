@@ -1,0 +1,96 @@
+module dev.avinlang.ssh
+
+import avin.io
+import avin.io.IoError
+
+// Why an SSH operation failed. A program tells the failures apart by case: a host whose key is not
+// known (`UnknownHostKey`) is a different decision from one whose key changed (`ChangedHostKey`), and
+// a refused login (`AuthFailed`) names the methods the server would have taken.
+data SshError
+  // The TCP connection could not be made: nothing listens there, the host cannot be reached, or the
+  // connect timeout ran out first (`IoError` of kind `TimedOut`).
+  Connect(error: IoError)
+  // The SSH handshake failed: the other end sent no SSH banner, or the two ends agreed no algorithms.
+  Handshake(reason: string)
+  // The known-hosts file holds no key for the host at this port; the server's key's SHA-256
+  // fingerprint, as `ssh-keygen -l` writes it, is `fingerprint`.
+  UnknownHostKey(host: string, port: int, fingerprint: string)
+  // The known-hosts file holds another key for the host at this port: its key changed, or something
+  // stands between the two ends.
+  ChangedHostKey(host: string, port: int, fingerprint: string)
+  // The server's key is not the one pinned by `HostKeys.Pinned`.
+  UnexpectedHostKey(expected: string, fingerprint: string)
+  // The known-hosts file could not be read or written.
+  KnownHosts(path: string, reason: string)
+  // The server refused the login by `method` (`publickey`, `password`, `agent`); `offered` are the
+  // methods it accepts for the user.
+  AuthFailed(method: string, offered: Vector[string])
+  // The private key file could not be read or used: it is missing, not a key, or its passphrase is
+  // wrong.
+  KeyFile(path: string, reason: string)
+  // The SSH agent could not be reached, or none of its keys was accepted.
+  Agent(reason: string)
+  // The server would not open a channel, run the command or start the subsystem.
+  ChannelRefused(reason: string)
+  // A wait for the server lasted longer than the session's timeout. The operation it was part of is
+  // left unfinished, so the session is unusable afterwards, as after `Interrupted`.
+  TimedOut(operation: string)
+  // The connection was lost: the server closed it, or the socket failed.
+  Disconnected(reason: string)
+  // The session or the command is closed, or the session was closed under the command.
+  Closed
+  // An earlier operation on the session stopped part-way, cancelled or timed out, which leaves the
+  // protocol in a state nothing can continue from: close the session and open another.
+  Interrupted
+  // A value the operation was given cannot be sent: a command or a path holding U+0000, a negative
+  // limit.
+  Invalid(reason: string)
+  // Any other failure libssh2 reported: its error code and its words.
+  Failed(code: int, reason: string)
+
+impl SshError
+  // Whether the failure came before anything reached the server beyond the connection's own setting
+  // up, so that trying again, here or on another host, cannot run a command twice: `Connect`,
+  // `Handshake` and `ChannelRefused`. Nothing retries by itself.
+  safeToRetry -> bool = self match
+    Connect(_) | Handshake(_) | ChannelRefused(_) -> true
+    _ -> false
+
+impl Error for SshError
+  // A sentence saying what went wrong, for a log; it never holds a password or a passphrase.
+  message -> string = self match
+    Connect(e) -> s"cannot connect: ${e.message}"
+    Handshake(reason) -> s"the SSH handshake failed: $reason"
+    UnknownHostKey(host, port, fp) -> s"the host key of ${hostName(host, port)} is not known ($fp)"
+    ChangedHostKey(host, port, fp) ->
+      s"the host key of ${hostName(host, port)} is not the one known for it ($fp): it changed, or something is in between"
+    UnexpectedHostKey(expected, fp) -> s"the host key is $fp, not the pinned $expected"
+    KnownHosts(path, reason) -> s"cannot use the known hosts in $path: $reason"
+    AuthFailed(method, offered) ->
+      val methods = if offered.isEmpty then "none" else offered.mkString(", ")
+      s"the server refused $method authentication (it offers: $methods)"
+    KeyFile(path, reason) -> s"cannot use the private key $path: $reason"
+    Agent(reason) -> s"SSH agent: $reason"
+    ChannelRefused(reason) -> s"the server refused the channel: $reason"
+    TimedOut(operation) -> s"timed out waiting to $operation"
+    Disconnected(reason) -> s"the connection was lost: $reason"
+    Closed -> "the session is closed"
+    Interrupted -> "an earlier operation on the session was interrupted, so it cannot be used"
+    Invalid(reason) -> reason
+    Failed(code, reason) -> s"libssh2 error $code: $reason"
+
+  cause -> Option[Error] = self match
+    Connect(e) -> Some(e)
+    _ -> None
+
+// `host:port`, or the host alone at the usual port.
+private hostName(host: string, port: int) -> string = if port == 22 then host else s"$host:$port"
+
+// The error as an `IoError`, for what reads and writes through the traits of `avin.io`: a wait that
+// timed out is `TimedOut`, a lost connection `ConnectionReset`, everything else `Other` in the error's
+// words.
+private asIoError(e: SshError, operation: string) -> IoError = e match
+  TimedOut(_) -> IoError(io.TimedOut, operation, "the SSH channel")
+  Disconnected(_) -> IoError(io.ConnectionReset, operation, "the SSH channel")
+  Connect(inner) -> inner
+  _ -> IoError(io.Other(e.message), operation, "the SSH channel")

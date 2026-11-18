@@ -1,0 +1,188 @@
+module dev.avinlang.ssh
+
+// What a session and its commands share: the libssh2 session, its socket, the waits on it, and the
+// state that says whether it may still be used. Only this module sees it.
+import avin.time.{Duration, monotonic}
+
+private class Link(
+    val raw: RawSession,
+    val socket: Socket,
+    val host: string,
+    val port: int,
+    val options: Options
+)
+  var closed = false
+  // Whether the release closes the descriptor: from the handshake on, the session holds it.
+  var holdsSocket = false
+  // Whether an operation stopped part-way, after which nothing can be sent on the session.
+  var interrupted = false
+  // Whether a wait is under way: a thread cancelled in one leaves it set, which marks the session
+  // interrupted at its next use.
+  var waiting = false
+  // The channels of the commands open on the session, closed before it.
+  val channels = Buffer[RawChannel]()
+  // The user the server was asked about, and the methods it offers that user.
+  var offered: Option[(string, Vector[string])] = None
+
+  // Whether the session can be used: open, and no operation of it stopped part-way.
+  isOpen -> bool = !closed && !interrupted && !waiting
+
+  // `Ok` where the session can be used, checking first that it belongs to the code running.
+  usable() -> Result[unit, SshError]
+    if closed then return Err(Closed)
+    noteCancelled()
+    if interrupted then Err(Interrupted) else Ok(())
+
+  // Checks the session belongs to the code running, and marks it interrupted where a wait of it never
+  // finished.
+  noteCancelled()
+    _ = raw.blockDirections()
+    if waiting
+      interrupted = true
+      waiting = false
+
+  // Shakes hands with the server over the socket, which the session holds from then on.
+  handshake() -> Result[unit, SshError]
+    loop
+      raw.handshake(socket.fd) match
+        Ok(_) ->
+          holdsSocket = true
+          return Ok(())
+        Err(code) ->
+          if code != eagain then return Err(failure(code, "shake hands with the server"))
+          await("shake hands with the server")?
+
+  // Gives everything back at once, with nothing said to the server: for a session that failed before
+  // it was handed out, or whose thread was cancelled while making it.
+  abandon()
+    if closed then return
+    closed = true
+    _ = raw.close()
+    if !holdsSocket then _ = closeRaw(socket.fd)
+
+  // Closes every command still open, says goodbye to the server unless the session was interrupted,
+  // and gives the session back.
+  close()
+    if closed then return
+    noteCancelled()
+    closed = true
+    val open = channels.toArray()
+    channels.clear()
+    for ch in open do retire(ch)
+    if !interrupted && holdsSocket
+      _ = within("disconnect", options.closeTimeout, () -> raw.disconnect(disconnectByApplication, "closed by the client", ""))
+    _ = raw.close()
+
+  // A new channel, for a command.
+  channel() -> Result[RawChannel, SshError]
+    loop
+      raw.openChannel("session", 7, long(windowDefault), long(packetDefault), 0) match
+        Some(ch) -> return Ok(ch)
+        None ->
+          val code = raw.lastErrno()
+          if code != eagain then return Err(failure(code, "open a channel"))
+          await("open a channel")?
+
+  // Closes `ch` the protocol's way, where the session can still talk, then gives it back.
+  retire(ch: RawChannel)
+    if !interrupted && !waiting
+      val sent = within("close a channel", options.closeTimeout, () -> ch.sendClose())
+      if sent is Ok(0)
+        _ = within("close a channel", options.closeTimeout, () -> ch.waitClosed())
+    _ = ch.close()
+
+  // Forgets the channel `ch`, whose command has closed it.
+  forget(ch: RawChannel) = channels.filterInPlace(c -> c !== ch)
+
+  // The methods the server offers `user`, asked once per user.
+  methodsFor(user: string) -> Result[Vector[string], SshError]
+    offered match
+      Some((u, methods)) if u == user -> return Ok(methods)
+      _ -> ()
+    loop
+      raw.authList(user, long(user.byteLength)) match
+        Some(list) ->
+          val methods = list.split(',').filter(m -> m.nonEmpty)
+          offered = Some((user, methods))
+          return Ok(methods)
+        None ->
+          if raw.authenticated() then return Ok([])
+          val code = raw.lastErrno()
+          if code != eagain then return Err(failure(code, "ask which logins the server takes"))
+          await("ask which logins the server takes")?
+
+  // Calls `step` until it answers anything but `EAGAIN`, waiting on the socket between, and answers
+  // what it answered then.
+  retrying(operation: string, step: () -> int) -> Result[int, SshError]
+    loop
+      val rc = step()
+      if rc != eagain then return Ok(rc)
+      await(operation)?
+
+  // `retrying` for calls answering a count, reads and writes.
+  retryingCount(operation: string, step: () -> long) -> Result[long, SshError]
+    loop
+      val rc = step()
+      if rc != long(eagain) then return Ok(rc)
+      await(operation)?
+
+  // `retrying`, waiting at most `limit` in all.
+  within(operation: string, limit: Duration, step: () -> int) -> Result[int, SshError]
+    val deadline = monotonic() + limit
+    loop
+      val rc = step()
+      if rc != eagain then return Ok(rc)
+      awaitUntil(operation, Some(deadline))?
+
+  // Waits, after a call answered `EAGAIN`, for the socket to be ready as libssh2 asks, at most the
+  // options' `timeout`.
+  await(operation: string) -> Result[unit, SshError] =
+    awaitUntil(operation, options.timeout.map(d -> monotonic() + d))
+
+  // Waits for the socket until `deadline` on the monotonic clock, where there is one, sending
+  // keepalives as they fall due meanwhile: `TimedOut` where the deadline passes first, which leaves the
+  // session interrupted.
+  awaitUntil(operation: string, deadline: Option[Duration]) -> Result[unit, SshError]
+    loop
+      var limit = Duration(0)
+      deadline.foreach(at -> limit = at - monotonic())
+      if deadline.isDefined && limit.micros <= 0
+        interrupted = true
+        return Err(TimedOut(operation))
+      if options.keepalive.isDefined && holdsSocket
+        val (rc, next) = raw.keepaliveSend()
+        if rc < 0 && rc != eagain
+          interrupted = true
+          return Err(failure(rc, operation))
+        val due = Duration(long(if next < 1 then 1 else next) * 1000000)
+        if limit.micros <= 0 || due < limit then limit = due
+      waiting = true
+      val ready = socket.wait(raw.blockDirections(), limit)
+      waiting = false
+      if ready then return Ok(())
+
+  // The error libssh2's `code` stands for, in its own words where it has them.
+  failure(code: int, operation: string) -> SshError
+    val (_, words) = raw.lastError(0)
+    val reason = words.getOrElse("")
+    errorOf(code, if reason.isEmpty then operation else reason)
+
+  // The error a refused login answers.
+  authFailure(code: int, method: string, keyPath: string) -> SshError
+    if code == authenticationFailed || code == publickeyUnverified
+      return AuthFailed(method, offered.map((_, m) -> m).getOrElse([]))
+    if code == fileError || code == keyfileAuthFailed
+      val (_, words) = raw.lastError(0)
+      return KeyFile(keyPath, words.getOrElse("it cannot be read"))
+    failure(code, s"log in with $method")
+
+// The error libssh2's `code` stands for, with `reason` its words.
+private errorOf(code: int, reason: string) -> SshError
+  if code == timeoutError || code == socketTimeout then return TimedOut(reason)
+  if code == socketDisconnect || code == socketSend || code == socketRecv || code == socketNone || code == badSocket
+    return Disconnected(reason)
+  if code == bannerRecv || code == bannerSend || code == kexFailure || code == keyExchangeFailure
+    return Handshake(reason)
+  if code == channelFailure || code == channelRequestDenied || code == requestDenied
+    return ChannelRefused(reason)
+  Failed(code, reason)

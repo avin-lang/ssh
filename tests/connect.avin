@@ -1,0 +1,211 @@
+module tests
+
+// Connecting: the handshake, the host key checked against the known-hosts file (strict, accepting new
+// keys, pinned), a connection refused, a connect timeout over the TCP connection and over a server
+// that never speaks, and closing.
+import avin.fs
+import avin.io
+import avin.net.TcpListener
+import avin.threads.{scope, withTimeout}
+import avin.time.{millis, monotonic, seconds}
+import dev.avinlang.ssh.{
+  AcceptNew, ChangedHostKey, Closed, Connect, Handshake, Options, Pinned, Session, SshError, Strict, UnexpectedHostKey,
+  UnknownHostKey
+}
+
+// A port nothing listens on: one a listener was just given and gave back.
+freePort() -> int
+  val l = TcpListener.bind("127.0.0.1", 0) match
+    Ok(l) -> l
+    Err(e) -> fail(e.message)
+  val port = l.port()
+  _ = l.close()
+  port
+
+@test("a session connects, checks the host key against known_hosts and closes")
+connects()
+  if server() is Some((dir, port, _))
+    val s = connected(dir, port)
+    assert(s.isOpen)
+    assertEq(s.host, "127.0.0.1")
+    assertEq(s.port, port)
+    assert(made(s.serverBanner()).startsWith("SSH-2.0-"))
+    assert(!s.isAuthenticated)
+    assert(s.close().isOk)
+    assert(!s.isOpen)
+
+@test("the host key's fingerprint is the one ssh-keygen writes for the server's key")
+fingerprint()
+  if server() is Some((dir, port, _))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    val fp = made(s.hostKeyFingerprint())
+    assert(fp.startsWith("SHA256:"))
+    assert(!fp.endsWith("="))
+    assertEq(fp.byteLength, 50)
+
+@test("closing twice is closing once, and a closed session answers Closed")
+closeTwice()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    assert(s.close().isOk)
+    assert(s.close().isOk)
+    assert(failure(s.authKey(user, s"$dir/client")) is Closed)
+    assert(failure(s.run("true")) is Closed)
+    assert(failure(s.serverBanner()) is Closed)
+
+@test("a host missing from known_hosts is refused under Strict, naming its fingerprint")
+unknownHost()
+  if server() is Some((dir, port, _))
+    val empty = s"$dir/empty_hosts"
+    made(fs.writeText(empty, "").mapErr(e -> fail(e.message)))
+    val r = Session.connect("127.0.0.1", port, Options(knownHosts = Some(empty)))
+    failure(r) match
+      UnknownHostKey(host, p, fp) ->
+        assertEq(host, "127.0.0.1")
+        assertEq(p, port)
+        assert(fp.startsWith("SHA256:"))
+      e -> fail(s"expected UnknownHostKey, got ${e.message}")
+
+@test("a known_hosts file that does not exist is a host missing from it")
+missingKnownHosts()
+  if server() is Some((dir, port, _))
+    val r = Session.connect("127.0.0.1", port, Options(knownHosts = Some(s"$dir/no/such/known_hosts")))
+    assert(failure(r) is UnknownHostKey(_, _, _))
+
+@test("a host listed with another key is refused, under Strict and under AcceptNew")
+changedHost()
+  if server() is Some((dir, port, _))
+    for policy in [Strict, AcceptNew]
+      val r = Session.connect("127.0.0.1", port, Options(knownHosts = Some(s"$dir/other_hosts"), hostKeys = policy))
+      failure(r) match
+        ChangedHostKey(host, p, fp) ->
+          assertEq(host, "127.0.0.1")
+          assertEq(p, port)
+          assert(fp.startsWith("SHA256:"))
+        e -> fail(s"expected ChangedHostKey, got ${e.message}")
+
+@test("the host name is matched as written: localhost is listed too, and another name is not")
+hostNames()
+  if server() is Some((dir, port, _))
+    val s = made(Session.connect("localhost", port, testOptions(dir)))
+    _ = s.close()
+
+@test("AcceptNew adds a missing host to the file, making it, and the next session matches it")
+acceptNew()
+  if server() is Some((dir, port, _))
+    val path = s"$dir/accepted/known_hosts"
+    if fs.exists(path) then made(fs.remove(path).mapErr(e -> fail(e.message)))
+    val first = made(Session.connect("127.0.0.1", port, Options(knownHosts = Some(path), hostKeys = AcceptNew)))
+    _ = first.close()
+    val text = fs.readText(path) match
+      Ok(t) -> t
+      Err(e) -> fail(e.message)
+    assert(text.startsWith(s"[127.0.0.1]:$port ssh-ed25519 "))
+    assert(text.endsWith("\n"))
+    // Now listed, the host passes Strict.
+    val second = made(Session.connect("127.0.0.1", port, Options(knownHosts = Some(path))))
+    _ = second.close()
+    // A second AcceptNew session adds nothing.
+    val third = made(Session.connect("127.0.0.1", port, Options(knownHosts = Some(path), hostKeys = AcceptNew)))
+    _ = third.close()
+    assertEq(fs.readText(path).getOrElse(""), text)
+
+@test("AcceptNew adds its line on a line of its own where the file's last line has no end")
+acceptNewAfterUnendedLine()
+  if server() is Some((dir, port, _))
+    val path = s"$dir/unended_hosts"
+    made(fs.writeText(path, "[example.invalid]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl").mapErr(e -> fail(e.message)))
+    val s = made(Session.connect("127.0.0.1", port, Options(knownHosts = Some(path), hostKeys = AcceptNew)))
+    _ = s.close()
+    val lines = fs.readText(path).getOrElse("").split('\n')
+    assertEq(lines.length, 3)
+    assert(lines(1).startsWith(s"[127.0.0.1]:$port ssh-ed25519 "))
+    assertEq(lines(2), "")
+
+@test("a pinned fingerprint is all that is checked: the right one connects without a known_hosts file")
+pinned()
+  if server() is Some((dir, port, _))
+    val fp = made(connected(dir, port).hostKeyFingerprint())
+    val s = made(Session.connect("127.0.0.1", port, Options(knownHosts = Some(s"$dir/no_such_file"), hostKeys = Pinned(fp))))
+    _ = s.close()
+
+@test("a pinned fingerprint that is not the server's is refused, naming both")
+pinnedWrong()
+  if server() is Some((dir, port, _))
+    val wrong = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    failure(Session.connect("127.0.0.1", port, Options(hostKeys = Pinned(wrong)))) match
+      UnexpectedHostKey(expected, fp) ->
+        assertEq(expected, wrong)
+        assert(fp.startsWith("SHA256:"))
+        assert(fp != wrong)
+      e -> fail(s"expected UnexpectedHostKey, got ${e.message}")
+
+@test("a port nothing listens on is refused, and that is safe to retry")
+refused()
+  failure(Session.connect("127.0.0.1", freePort())) match
+    Connect(e) -> assertEq(e.kind, io.ConnectionRefused)
+    e -> fail(s"expected Connect, got ${e.message}")
+  assert(failure(Session.connect("127.0.0.1", freePort())).safeToRetry)
+
+@test("the connect timeout bounds a server that takes the connection and never speaks")
+silentServer()
+  val l = TcpListener.bind("127.0.0.1", 0) match
+    Ok(l) -> l
+    Err(e) -> fail(e.message)
+  defer _ = l.close()
+  val began = monotonic()
+  val r = Session.connect("127.0.0.1", l.port(), Options(connectTimeout = Some(millis(300))))
+  val took = monotonic() - began
+  failure(r) match
+    Connect(e) -> assertEq(e.kind, io.TimedOut)
+    e -> fail(s"expected Connect, got ${e.message}")
+  assert(took >= millis(250))
+  assert(took < seconds(5))
+
+@test("a server that closes the connection at once fails the handshake")
+closingServer()
+  val l = TcpListener.bind("127.0.0.1", 0) match
+    Ok(l) -> l
+    Err(e) -> fail(e.message)
+  defer _ = l.close()
+  scope(sc ->
+    sc.spawn(() ->
+      l.accept() match
+        Ok(c) -> _ = c.close()
+        Err(_) -> ())
+    val r = Session.connect("127.0.0.1", l.port(), Options(connectTimeout = Some(seconds(10))))
+    val e = failure(r)
+    assert(e is Handshake(_) || e.message.contains("lost"))
+    assert(!(e is Connect(_))))
+
+@test("a server that sends something other than SSH fails the handshake")
+notSsh()
+  val l = TcpListener.bind("127.0.0.1", 0) match
+    Ok(l) -> l
+    Err(e) -> fail(e.message)
+  defer _ = l.close()
+  scope(sc ->
+    sc.spawn(() ->
+      l.accept() match
+        Ok(c) ->
+          _ = c.writeText("HTTP/1.1 400 Bad Request\r\n\r\n")
+          _ = c.close()
+        Err(_) -> ())
+    val r = Session.connect("127.0.0.1", l.port(), Options(connectTimeout = Some(seconds(10))))
+    assert(r.isErr))
+
+@test("the calling thread's deadline bounds connecting as the connect timeout does")
+callerDeadline()
+  val l = TcpListener.bind("127.0.0.1", 0) match
+    Ok(l) -> l
+    Err(e) -> fail(e.message)
+  defer _ = l.close()
+  val began = monotonic()
+  val r = withTimeout(millis(300), _ -> Session.connect("127.0.0.1", l.port()).isOk)
+  assertEq(r, None)
+  assert(monotonic() - began < seconds(5))
+
+@test("a host holding U+0000 is refused before anything is sent")
+nulHost()
+  assert(failure(Session.connect("127.0.0.1\u0000x", 22)).message.contains("U+0000"))

@@ -1,0 +1,108 @@
+module dev.avinlang.ssh
+
+// How a session decides whether to trust the server's host key, and the check itself.
+import avin.encoding
+import avin.fs
+import avin.process
+
+// What a session trusts as the server's host key.
+data HostKeys
+  // The key must be in the known-hosts file under the host (and the port, where it is not 22): a host
+  // missing from the file is `UnknownHostKey`, one listed with another key `ChangedHostKey`. The
+  // default.
+  Strict
+  // As `Strict`, except that a host missing from the file is trusted and its key added to the end of
+  // the file, made where it does not exist; a host listed with another key is still refused.
+  AcceptNew
+  // Exactly the key whose SHA-256 fingerprint is `fingerprint`, written as `ssh-keygen -l` writes it
+  // (`SHA256:` and unpadded base64); the known-hosts file is not read.
+  Pinned(fingerprint: string)
+
+// The known-hosts file a session reads where its options name none: `~/.ssh/known_hosts`.
+defaultKnownHosts() -> string = process.homeDir() match
+  Some(home) -> s"$home/.ssh/known_hosts"
+  None -> ".ssh/known_hosts"
+
+// The SHA-256 fingerprint of a key's 32-byte hash, as `ssh-keygen -l` writes it.
+private fingerprintOf(hash: Array[byte]) -> string =
+  val text = encoding.toBase64(hash.toVector)
+  var end = text.byteLength
+  while end > 0 && text.byteAt(end - 1) == byte(int('='))
+    end -= 1
+  s"SHA256:${text.slice(0, end)}"
+
+// The known-hosts mask of a libssh2 host key type, and the name a known-hosts line gives that type.
+private keyMask(kind: int) -> int = kind match
+  1 -> knownKeyRsa
+  2 -> knownKeyDss
+  3 -> knownKeyEcdsa256
+  4 -> knownKeyEcdsa384
+  5 -> knownKeyEcdsa521
+  6 -> knownKeyEd25519
+  _ -> knownKeyUnknown
+
+private keyName(kind: int) -> Option[string] = kind match
+  1 -> Some("ssh-rsa")
+  2 -> Some("ssh-dss")
+  3 -> Some("ecdsa-sha2-nistp256")
+  4 -> Some("ecdsa-sha2-nistp384")
+  5 -> Some("ecdsa-sha2-nistp521")
+  6 -> Some("ssh-ed25519")
+  _ -> None
+
+// The name a known-hosts file gives the host at `port`: the host alone at 22, `[host]:port` elsewhere.
+private knownName(host: string, port: int) -> string = if port == 22 then host else s"[$host]:$port"
+
+// Checks the key the server presented in the handshake of `raw` by `policy`, reading `path` where the
+// policy reads a file.
+private verifyHostKey(raw: RawSession, host: string, port: int, policy: HostKeys, path: string) -> Result[unit, SshError]
+  val (view, length, kind) = raw.hostKey()
+  val key = view match
+    Some(v) -> v.copy()
+    None -> return Err(Handshake("the server presented no host key"))
+  val fingerprint = raw.hostKeyHash(hashSha256) match
+    Some(v) -> fingerprintOf(v.copy())
+    None -> return Err(Handshake("the server's host key could not be hashed"))
+  if length != long(key.length) then return Err(Handshake("the server's host key could not be read"))
+  policy match
+    Pinned(expected) -> if expected == fingerprint then Ok(()) else Err(UnexpectedHostKey(expected, fingerprint))
+    _ ->
+      val list = raw.knownHosts() match
+        Some(l) -> l
+        None -> return Err(KnownHosts(path, "libssh2 could not make a list of known hosts"))
+      defer _ = list.close()
+      val present = fs.exists(path)
+      if present && list.readFile(path, knownHostFileOpenssh) < 0
+        return Err(KnownHosts(path, "the file could not be read as an OpenSSH known-hosts file"))
+      val found = if present then list.check(host, port, key, knownHostTypePlain | knownHostKeyRaw | keyMask(kind)) else checkNotFound
+      if found == checkMatch then return Ok(())
+      if found == checkMismatch then return Err(ChangedHostKey(host, port, fingerprint))
+      if found != checkNotFound then return Err(KnownHosts(path, "libssh2 could not check the host against it"))
+      policy match
+        AcceptNew -> added(path, host, port, kind, key)
+        _ -> Err(UnknownHostKey(host, port, fingerprint))
+
+// Adds the line for the host's key to the end of the known-hosts file, making the file and its
+// directory where they do not exist.
+private added(path: string, host: string, port: int, kind: int, key: Array[byte]) -> Result[unit, SshError]
+  val name = keyName(kind) match
+    Some(n) -> n
+    None -> return Err(KnownHosts(path, s"the server's key is of a type ($kind) a known-hosts line cannot name"))
+  val slash = lastSlash(path)
+  if slash > 0 && !fs.exists(path.slice(0, slash))
+    fs.createDirAll(path.slice(0, slash)).mapErr(e -> KnownHosts(path, e.message))?
+  val line = s"${knownName(host, port)} $name ${encoding.toBase64(key.toVector)}\n"
+  // A file whose last line has no end gets one first, so the new line stands on its own.
+  val before =
+    if fs.exists(path)
+      val text = fs.readText(path).mapErr(e -> KnownHosts(path, e.message))?
+      if text.byteLength > 0 && text.byteAt(text.byteLength - 1) != byte(10) then "\n" else ""
+    else ""
+  fs.appendText(path, before + line).mapErr(e -> KnownHosts(path, e.message))
+
+// Where the last `/` of `path` is, or -1.
+private lastSlash(path: string) -> int
+  var i = path.byteLength - 1
+  while i >= 0 && path.byteAt(i) != byte(int('/'))
+    i -= 1
+  i

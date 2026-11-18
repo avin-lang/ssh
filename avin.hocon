@@ -1,0 +1,18 @@
+package {
+  name = "ssh"
+  version = "0.0.1"
+  description = "An SSH client binding libssh2: sessions over non-blocking sockets that park lightweight threads rather than workers, host keys checked against known_hosts, agent, key and password authentication, and commands with streamed output, standard input and exit status"
+  avin = "0.0.31"
+}
+
+dependencies {
+}
+
+c-libraries {
+  libssh2 {
+    pkg-config = "libssh2"
+    headers    = ["<libssh2.h>", "<libssh2_sftp.h>"]
+    install    = "libssh2 1.11 or later: `brew install libssh2`; Debian's libssh2-1-dev"
+  }
+  libc { headers = ["<unistd.h>", "<poll.h>", "<sys/socket.h>"] }
+}

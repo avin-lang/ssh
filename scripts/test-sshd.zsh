@@ -11,7 +11,8 @@
 #   scripts/test-sshd.zsh env [dir]     prints the variables the tests read
 #
 # The directory defaults to $SSH_TEST_DIR, or .sshd-test in the package. `start` prints the variables
-# to export: SSH_TEST_DIR, SSH_TEST_PORT and SSH_TEST_USER. The tests skip, saying so, where
+# to export: SSH_TEST_DIR, SSH_TEST_PORT, SSH_TEST_USER, and SSH_AUTH_SOCK naming the private agent,
+# which the README's examples log in with. The tests skip, saying so, where
 # SSH_TEST_DIR is unset. In the directory:
 #
 #   client          the key the server authorizes, with no passphrase (and client.pub)
@@ -37,6 +38,7 @@ print_env() {
   print -r -- "export SSH_TEST_DIR=$root"
   print -r -- "export SSH_TEST_PORT=$port"
   print -r -- "export SSH_TEST_USER=$user"
+  print -r -- "export SSH_AUTH_SOCK=$root/agent.sock"
 }
 
 running() {

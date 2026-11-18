@@ -1,0 +1,62 @@
+module tests
+
+// The errors: each case's sentence, what it says it was caused by, and which are safe to retry.
+import avin.io
+import avin.io.IoError
+import dev.avinlang.ssh.{
+  Agent, AuthFailed, ChangedHostKey, ChannelRefused, Closed, Connect, Disconnected, Exited, Failed, Handshake,
+  Interrupted, Invalid, KeyFile, KnownHosts, Output, Signalled, SshError, TimedOut, UnexpectedHostKey,
+  UnknownHostKey
+}
+
+@test("each error says what went wrong in a sentence of its own")
+messages()
+  val refused = IoError(io.ConnectionRefused, "connect to", "h:22")
+  assertEq(Connect(refused).message, "cannot connect: cannot connect to h:22: connection refused")
+  assertEq(Handshake("no banner").message, "the SSH handshake failed: no banner")
+  assertEq(UnknownHostKey("h", 22, "SHA256:x").message, "the host key of h is not known (SHA256:x)")
+  assertEq(UnknownHostKey("h", 2222, "SHA256:x").message, "the host key of h:2222 is not known (SHA256:x)")
+  assert(ChangedHostKey("h", 22, "SHA256:x").message.contains("is not the one known for it (SHA256:x)"))
+  assertEq(UnexpectedHostKey("SHA256:a", "SHA256:b").message, "the host key is SHA256:b, not the pinned SHA256:a")
+  assertEq(KnownHosts("/k", "bad").message, "cannot use the known hosts in /k: bad")
+  assertEq(
+    AuthFailed("password", ["publickey", "password"]).message,
+    "the server refused password authentication (it offers: publickey, password)"
+  )
+  assertEq(AuthFailed("publickey", []).message, "the server refused publickey authentication (it offers: none)")
+  assertEq(KeyFile("/k", "wrong passphrase").message, "cannot use the private key /k: wrong passphrase")
+  assertEq(Agent("no keys").message, "SSH agent: no keys")
+  assertEq(ChannelRefused("denied").message, "the server refused the channel: denied")
+  assertEq(TimedOut("read").message, "timed out waiting to read")
+  assertEq(Disconnected("eof").message, "the connection was lost: eof")
+  assertEq(Closed.message, "the session is closed")
+  assert(Interrupted.message.contains("interrupted"))
+  assertEq(Invalid("bad").message, "bad")
+  assertEq(Failed(-34, "invalid").message, "libssh2 error -34: invalid")
+
+@test("only a connection's own failures are safe to retry")
+retry()
+  assert(Connect(IoError(io.TimedOut, "connect to", "h")).safeToRetry)
+  assert(Handshake("x").safeToRetry)
+  assert(ChannelRefused("x").safeToRetry)
+  val never: Vector[SshError] = [
+    UnknownHostKey("h", 22, "f"), ChangedHostKey("h", 22, "f"), AuthFailed("password", []), TimedOut("x"),
+    Disconnected("x"), Closed, Interrupted, Failed(-1, "x")
+  ]
+  for e in never do assert(!e.safeToRetry)
+
+@test("a connection's failure names its IoError as its cause; the others have none")
+causes()
+  val io = IoError(io.ConnectionRefused, "connect to", "h")
+  assertEq(Connect(io).cause.map(c -> c.message), Some(io.message))
+  assert(Closed.cause.isEmpty)
+
+@test("an exit status is a success only for code 0")
+exitStatus()
+  assert(Exited(0).success)
+  assert(!Exited(1).success)
+  assert(!Signalled("TERM", "").success)
+  val o = Output(Exited(0), "hi\n".utf8, Array.empty[byte](), false)
+  assert(o.success)
+  assertEq(o.stdoutText, "hi\n")
+  assertEq(o.stderrText, "")

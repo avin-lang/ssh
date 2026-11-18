@@ -1,0 +1,309 @@
+module dev.avinlang.ssh
+
+// libssh2's C interface as the package uses it: the bindings are the package's whole trusted surface.
+// Every session runs non-blocking, so a call that would have to wait for the server answers
+// `LIBSSH2_ERROR_EAGAIN` and is made again once the socket is ready; nothing here ever blocks.
+//
+// libssh2 counts no references. A channel, a known-hosts list and an agent belong to their session,
+// and `libssh2_session_free` frees every channel still open, so each of those names its session with
+// `kept:`: the session's handle is kept from the collector until theirs has been given back, and
+// their release sees the session as null once it was closed, when what they would free is already
+// gone with it.
+import avin.c.ByteView
+
+@c("int libssh2_init(int flags)")
+private initRaw(flags: int) -> int
+
+// libssh2's global state, made once, before the first session: `libssh2_init` is not safe to call from
+// two threads at once, and a lazy value is made by one.
+private lazy val initialized: int = initRaw(0)
+
+// Makes libssh2 ready, once: zero where it is, and its error code where it could not be.
+private ready() -> int = initialized
+
+@c(const: "LIBSSH2_ERROR_EAGAIN")
+private val eagain: int
+
+@c(const: "LIBSSH2_ERROR_SOCKET_NONE")
+private val socketNone: int
+
+@c(const: "LIBSSH2_ERROR_BANNER_RECV")
+private val bannerRecv: int
+
+@c(const: "LIBSSH2_ERROR_BANNER_SEND")
+private val bannerSend: int
+
+@c(const: "LIBSSH2_ERROR_KEX_FAILURE")
+private val kexFailure: int
+
+@c(const: "LIBSSH2_ERROR_SOCKET_SEND")
+private val socketSend: int
+
+@c(const: "LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE")
+private val keyExchangeFailure: int
+
+@c(const: "LIBSSH2_ERROR_TIMEOUT")
+private val timeoutError: int
+
+@c(const: "LIBSSH2_ERROR_SOCKET_DISCONNECT")
+private val socketDisconnect: int
+
+@c(const: "LIBSSH2_ERROR_FILE")
+private val fileError: int
+
+@c(const: "LIBSSH2_ERROR_AUTHENTICATION_FAILED")
+private val authenticationFailed: int
+
+@c(const: "LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED")
+private val publickeyUnverified: int
+
+@c(const: "LIBSSH2_ERROR_CHANNEL_FAILURE")
+private val channelFailure: int
+
+@c(const: "LIBSSH2_ERROR_CHANNEL_REQUEST_DENIED")
+private val channelRequestDenied: int
+
+@c(const: "LIBSSH2_ERROR_SOCKET_TIMEOUT")
+private val socketTimeout: int
+
+@c(const: "LIBSSH2_ERROR_REQUEST_DENIED")
+private val requestDenied: int
+
+@c(const: "LIBSSH2_ERROR_SOCKET_RECV")
+private val socketRecv: int
+
+@c(const: "LIBSSH2_ERROR_BAD_SOCKET")
+private val badSocket: int
+
+@c(const: "LIBSSH2_ERROR_KEYFILE_AUTH_FAILED")
+private val keyfileAuthFailed: int
+
+@c(const: "LIBSSH2_SESSION_BLOCK_INBOUND")
+private val blockInbound: int
+
+@c(const: "LIBSSH2_SESSION_BLOCK_OUTBOUND")
+private val blockOutbound: int
+
+@c(const: "LIBSSH2_HOSTKEY_HASH_SHA256")
+private val hashSha256: int
+
+@c(const: "SSH_DISCONNECT_BY_APPLICATION")
+private val disconnectByApplication: int
+
+@c(const: "LIBSSH2_CHANNEL_WINDOW_DEFAULT")
+private val windowDefault: int
+
+@c(const: "LIBSSH2_CHANNEL_PACKET_DEFAULT")
+private val packetDefault: int
+
+@c(const: "LIBSSH2_CHANNEL_EXTENDED_DATA_IGNORE")
+private val extendedIgnore: int
+
+@c(const: "LIBSSH2_CHANNEL_EXTENDED_DATA_MERGE")
+private val extendedMerge: int
+
+@c(const: "SSH_EXTENDED_DATA_STDERR")
+private val stderrStream: int
+
+@c(const: "LIBSSH2_KNOWNHOST_FILE_OPENSSH")
+private val knownHostFileOpenssh: int
+
+@c(const: "LIBSSH2_KNOWNHOST_TYPE_PLAIN")
+private val knownHostTypePlain: int
+
+@c(const: "LIBSSH2_KNOWNHOST_KEYENC_RAW")
+private val knownHostKeyRaw: int
+
+@c(const: "LIBSSH2_KNOWNHOST_CHECK_MATCH")
+private val checkMatch: int
+
+@c(const: "LIBSSH2_KNOWNHOST_CHECK_MISMATCH")
+private val checkMismatch: int
+
+@c(const: "LIBSSH2_KNOWNHOST_CHECK_NOTFOUND")
+private val checkNotFound: int
+
+@c(const: "LIBSSH2_KNOWNHOST_KEY_SSHRSA")
+private val knownKeyRsa: int
+
+@c(const: "LIBSSH2_KNOWNHOST_KEY_SSHDSS")
+private val knownKeyDss: int
+
+@c(const: "LIBSSH2_KNOWNHOST_KEY_ECDSA_256")
+private val knownKeyEcdsa256: int
+
+@c(const: "LIBSSH2_KNOWNHOST_KEY_ECDSA_384")
+private val knownKeyEcdsa384: int
+
+@c(const: "LIBSSH2_KNOWNHOST_KEY_ECDSA_521")
+private val knownKeyEcdsa521: int
+
+@c(const: "LIBSSH2_KNOWNHOST_KEY_ED25519")
+private val knownKeyEd25519: int
+
+@c(const: "LIBSSH2_KNOWNHOST_KEY_UNKNOWN")
+private val knownKeyUnknown: int
+
+// A session. It holds a descriptor of its own, `dup`ed from the connection's, which its release shuts
+// down before freeing the session, so that `libssh2_session_free`, made blocking to finish its work,
+// meets a socket that answers at once rather than one that could keep it waiting on the server; the
+// release then closes the descriptor. A descriptor it does not yet hold, before the handshake, is the
+// package's to close.
+@c(
+  type: "LIBSSH2_SESSION *",
+  holds: "int sock = -1",
+  release: "(sock >= 0 ? shutdown(sock, SHUT_RDWR) : 0, libssh2_session_set_blocking(self, 1), libssh2_session_free(self), sock >= 0 ? close(sock) : 0)"
+)
+private class RawSession
+  @c("void libssh2_session_set_blocking(LIBSSH2_SESSION *self, int blocking)")
+  setBlocking(blocking: int)
+
+  @c("int libssh2_session_handshake(LIBSSH2_SESSION *self, libssh2_socket_t sock)", hold: "sock")
+  handshake(sock: int) -> Result[unit, int]
+
+  @c("int libssh2_session_block_directions(LIBSSH2_SESSION *self)")
+  blockDirections() -> int
+
+  @c("int libssh2_session_last_errno(LIBSSH2_SESSION *self)")
+  lastErrno() -> int
+
+  @c("int libssh2_session_last_error(LIBSSH2_SESSION *self, out char **errmsg, null int *errmsg_len, int want_buf)")
+  lastError(wantBuf: int) -> (int, Option[string])
+
+  @c("const char *libssh2_session_hostkey(LIBSSH2_SESSION *self, out size_t *len, out int *type)", view, length: "len")
+  hostKey() -> (Option[ByteView], long, int)
+
+  @c("const char *libssh2_hostkey_hash(LIBSSH2_SESSION *self, int hash_type)", view, length: "32")
+  hostKeyHash(hashType: int) -> Option[ByteView]
+
+  @c("const char *libssh2_session_banner_get(LIBSSH2_SESSION *self)")
+  banner() -> Option[string]
+
+  @c("int libssh2_session_disconnect_ex(LIBSSH2_SESSION *self, int reason, const char *description, const char *lang)")
+  disconnect(reason: int, description: string, lang: string) -> int
+
+  @c("void libssh2_keepalive_config(LIBSSH2_SESSION *self, int want_reply, unsigned int interval)")
+  keepaliveConfig(wantReply: int, interval: long)
+
+  @c("int libssh2_keepalive_send(LIBSSH2_SESSION *self, out int *seconds_to_next)")
+  keepaliveSend() -> (int, int)
+
+  @c("char *libssh2_userauth_list(LIBSSH2_SESSION *self, const char *username, unsigned int username_len)")
+  authList(user: string, userLength: long) -> Option[string]
+
+  @c("int libssh2_userauth_authenticated(LIBSSH2_SESSION *self)")
+  authenticated() -> bool
+
+  @c(
+    "int libssh2_userauth_publickey_fromfile_ex(LIBSSH2_SESSION *self, const char *username, unsigned int username_len, const char *publickey, const char *privatekey, const char *passphrase)"
+  )
+  authKeyFile(user: string, userLength: long, publicKey: Option[string], privateKey: string, passphrase: Option[string]) -> int
+
+  @c(
+    "int libssh2_userauth_password_ex(LIBSSH2_SESSION *self, const char *username, unsigned int username_len, const char *password, unsigned int password_len, null void (*passwd_change_cb)(LIBSSH2_SESSION *session, char **newpw, int *newpw_len, void **abstract))"
+  )
+  authPassword(user: string, userLength: long, password: string, passwordLength: long) -> int
+
+  @c(
+    "LIBSSH2_CHANNEL *libssh2_channel_open_ex(LIBSSH2_SESSION *self, const char *channel_type, unsigned int channel_type_len, unsigned int window_size, unsigned int packet_size, null const char *message, unsigned int message_len)",
+    keeps: "self"
+  )
+  openChannel(kind: string, kindLength: long, window: long, packet: long, messageLength: long) -> Option[RawChannel]
+
+  @c("LIBSSH2_KNOWNHOSTS *libssh2_knownhost_init(LIBSSH2_SESSION *self)", keeps: "self")
+  knownHosts() -> Option[RawKnownHosts]
+
+  @c("LIBSSH2_AGENT *libssh2_agent_init(LIBSSH2_SESSION *self)", keeps: "self")
+  agent() -> Option[RawAgent]
+
+@c(
+  "LIBSSH2_SESSION *libssh2_session_init_ex(null void *(*my_alloc)(size_t count, void **abstract), null void (*my_free)(void *ptr, void **abstract), null void *(*my_realloc)(void *ptr, size_t count, void **abstract), null void *abstract)"
+)
+private sessionInit() -> Option[RawSession]
+
+// A channel of a session. The package closes it with the protocol's close and waits for the server's
+// before giving the handle back, so that the release's `libssh2_channel_free` has nothing left to say
+// to the server; a channel given back still open sends its close and is freed with its session.
+@c(type: "LIBSSH2_CHANNEL *", kept: "session: RawSession", release: "session ? libssh2_channel_free(self) : 0")
+private class RawChannel
+  @c("int libssh2_channel_handle_extended_data2(LIBSSH2_CHANNEL *self, int ignore_mode)")
+  extendedData(mode: int) -> int
+
+  @c(
+    "int libssh2_channel_process_startup(LIBSSH2_CHANNEL *self, const char *request, unsigned int request_len, const char *message, unsigned int message_len)"
+  )
+  startup(request: string, requestLength: long, message: string, messageLength: long) -> int
+
+  @c("ssize_t libssh2_channel_read_ex(LIBSSH2_CHANNEL *self, int stream_id, char *buf, length(buf) size_t buflen)")
+  readInto(stream: int, buf: Array[byte]) -> long
+
+  @c("ssize_t libssh2_channel_write_ex(LIBSSH2_CHANNEL *self, int stream_id, const char *buf, length(buf) size_t buflen)")
+  writeFrom(stream: int, buf: Array[byte]) -> long
+
+  @c("int libssh2_channel_send_eof(LIBSSH2_CHANNEL *self)")
+  sendEof() -> int
+
+  @c("int libssh2_channel_eof(LIBSSH2_CHANNEL *self)")
+  atEof() -> int
+
+  @c("int libssh2_channel_close(LIBSSH2_CHANNEL *self)")
+  sendClose() -> int
+
+  @c("int libssh2_channel_wait_closed(LIBSSH2_CHANNEL *self)")
+  waitClosed() -> int
+
+  @c("int libssh2_channel_get_exit_status(LIBSSH2_CHANNEL *self)")
+  exitStatus() -> int
+
+  @c(
+    "int libssh2_channel_get_exit_signal(LIBSSH2_CHANNEL *self, out char **exitsignal, out size_t *exitsignal_len, out char **errmsg, out size_t *errmsg_len, null char **langtag, null size_t *langtag_len)",
+    free: ["exitsignal: libssh2_free(session, exitsignal)", "errmsg: libssh2_free(session, errmsg)"]
+  )
+  exitSignal() -> Result[(Option[string], long, Option[string], long), int]
+
+// The known hosts read from a file, to check a server's key against. Freed through its session.
+@c(
+  type: "LIBSSH2_KNOWNHOSTS *",
+  kept: "session: RawSession",
+  release: "session ? (libssh2_knownhost_free(self), 0) : 0"
+)
+private class RawKnownHosts
+  @c("int libssh2_knownhost_readfile(LIBSSH2_KNOWNHOSTS *self, const char *filename, int type)")
+  readFile(path: string, kind: int) -> int
+
+  @c(
+    "int libssh2_knownhost_checkp(LIBSSH2_KNOWNHOSTS *self, const char *host, int port, const char *key, length(key) size_t keylen, int typemask, null struct libssh2_knownhost **knownhost)"
+  )
+  check(host: string, port: int, key: Array[byte], typemask: int) -> int
+
+// A connection to an SSH agent, made through a session. Talking to the agent is a local socket's
+// round trip, so those calls are `blocking`.
+@c(
+  type: "LIBSSH2_AGENT *",
+  kept: "session: RawSession",
+  release: "session ? (libssh2_agent_disconnect(self), libssh2_agent_free(self), 0) : 0"
+)
+private class RawAgent
+  @c("void libssh2_agent_set_identity_path(LIBSSH2_AGENT *self, const char *path)")
+  setPath(path: string)
+
+  @c("int libssh2_agent_connect(LIBSSH2_AGENT *self)", blocking)
+  connect() -> int
+
+  @c("int libssh2_agent_list_identities(LIBSSH2_AGENT *self)", blocking)
+  listIdentities() -> int
+
+  @c(
+    "int libssh2_agent_get_identity(LIBSSH2_AGENT *self, out struct libssh2_agent_publickey **store, struct libssh2_agent_publickey *prev)",
+    keeps: "self"
+  )
+  identity(prev: Option[AgentKey]) -> (int, Option[AgentKey])
+
+  @c("int libssh2_agent_userauth(LIBSSH2_AGENT *self, const char *username, struct libssh2_agent_publickey *identity)", blocking)
+  userauth(user: string, key: AgentKey) -> int
+
+// One key an agent holds, which belongs to the agent's list of them and is freed with it, so giving
+// the handle back frees nothing. It is valid until the list is read again or the agent is freed, so
+// the package uses each only within the one call that read the list, while the agent is open.
+@c(type: "struct libssh2_agent_publickey *", kept: "agent: RawAgent", release: "(void)self, (void)agent")
+private class AgentKey

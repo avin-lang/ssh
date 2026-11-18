@@ -1,0 +1,48 @@
+module tests
+
+// Many sessions at once on lightweight threads, one each, against the one server; sessions nobody
+// closed, given back by the collector; and a session's ownership, which belongs to one thread.
+import avin.threads.scope
+import avin.time.{monotonic, seconds}
+import dev.avinlang.ssh.Session
+
+// What one thread does: connects, logs in, runs a command and closes, answering what the command
+// printed or what failed.
+private oneSession(dir: string, port: int, user: string, i: int) -> string
+  Session.connect("127.0.0.1", port, testOptions(dir)) match
+    Err(e) -> s"connect: ${e.message}"
+    Ok(s) ->
+      defer _ = s.close()
+      s.authKey(user, s"$dir/client") match
+        Err(e) -> s"auth: ${e.message}"
+        Ok(_) ->
+          s.run(s"echo $i") match
+            Ok(o) -> o.stdoutText.trim
+            Err(e) -> s"run: ${e.message}"
+
+@test("two hundred sessions run at once on lightweight threads, each its own command")
+twoHundred()
+  if server() is Some((dir, port, user))
+    val began = monotonic()
+    val answers = scope(sc ->
+      val threads = (0 ..< 200).map(i -> sc.spawn(() -> oneSession(dir, port, user, i)))
+      threads.map(t -> t.join()))
+    val took = monotonic() - began
+    for i in 0 ..< 200 do assertEq(answers(i), s"$i")
+    println(s"200 sessions took $took")
+    assert(took < seconds(120))
+
+@test("sessions and commands nobody closed are given back by the collector, commands first")
+collected()
+  if server() is Some((dir, port, user))
+    for i in 0 ..< 30
+      val s = loggedIn(dir, port, user)
+      // A command left open, its output unread, and a session nobody closes.
+      _ = made(s.exec("echo left"))
+      if i % 3 == 0
+        val e = made(s.exec("cat"))
+        made(e.stdin("x".utf8))
+    // Sessions made after them still work.
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    assertEq(made(s.run("echo still")).stdoutText, "still\n")

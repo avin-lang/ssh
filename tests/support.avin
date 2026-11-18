@@ -1,0 +1,42 @@
+module tests
+
+// What the tests share: the private SSH server `scripts/test-sshd.zsh start` runs, found through the
+// variables it prints (`SSH_TEST_DIR`, `SSH_TEST_PORT`, `SSH_TEST_USER`), and sessions made with it. A
+// test that needs the server and finds no `SSH_TEST_DIR` says so and passes.
+import avin.process
+import avin.time.seconds
+import dev.avinlang.ssh.{Options, Session, SshError, Strict}
+
+// The server's directory, port and user, or `None`, saying the test is skipped, where `SSH_TEST_DIR`
+// is not set.
+server() -> Option[(string, int, string)] = process.env("SSH_TEST_DIR") match
+  Some(dir) ->
+    val port = process.env("SSH_TEST_PORT").flatMap(p -> p.toIntOption()).getOrElse(22220)
+    val user = process.env("SSH_TEST_USER").getOrElse("")
+    Some((dir, port, user))
+  None ->
+    println("skipped: SSH_TEST_DIR is not set; run `scripts/test-sshd.zsh start` and export what it prints")
+    None
+
+// The options every test session starts from: the server's own known-hosts file, and a timeout no
+// wait of a passing test comes near.
+testOptions(dir: string) -> Options = Options(knownHosts = Some(s"$dir/known_hosts"), timeout = Some(30.seconds))
+
+// The value of a result the test expects to succeed.
+made[T](r: Result[T, SshError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"SSH failed: ${e.message}")
+
+// The error of a result the test expects to fail.
+failure[T](r: Result[T, SshError]) -> SshError = r match
+  Ok(_) -> fail("SSH succeeded")
+  Err(e) -> e
+
+// A session with the test server, not logged in.
+connected(dir: string, port: int) -> Session = made(Session.connect("127.0.0.1", port, testOptions(dir)))
+
+// A session with the test server, logged in with the client key.
+loggedIn(dir: string, port: int, user: string) -> Session =
+  val s = connected(dir, port)
+  made(s.authKey(user, s"$dir/client"))
+  s

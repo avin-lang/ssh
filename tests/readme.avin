@@ -1,0 +1,78 @@
+module tests
+
+// The README's examples, against the test server, logged in through the agent `SSH_AUTH_SOCK` names,
+// which `scripts/test-sshd.zsh env` points at the server's own.
+import avin.threads.{scope, withTimeout}
+import avin.time.seconds
+import dev.avinlang.ssh.{Exited, Options, Session, Signalled, SshError, Stderr, Stdout}
+
+uname(
+  host: string,
+  user: string,
+  port: int = 22,
+  options: Options = Options(connectTimeout = Some(10.seconds))
+) -> Result[string, SshError] =
+  val session = Session.connect(host, port, options)?
+  defer _ = session.close()
+  session.authAgent(user)?
+  val out = session.run("uname -a")?
+  Ok(out.stdoutText.trim)
+
+follow(session: Session, command: string) -> Result[int, SshError] =
+  val running = session.exec(command)?
+  defer _ = running.close()
+  loop
+    running.next()? match
+      Some(Stdout(bytes)) -> print(string.fromUtf8Lossy(bytes))
+      Some(Stderr(bytes)) -> print(s"! ${string.fromUtf8Lossy(bytes)}")
+      None -> break
+  running.wait()? match
+    Exited(code) -> Ok(code)
+    Signalled(signal, _) -> Ok(128)
+
+onEach(
+  hosts: Vector[string],
+  user: string,
+  command: string,
+  port: int = 22,
+  options: Options = Options()
+) -> Vector[(string, string)] =
+  scope(sc ->
+    val threads = hosts.map(host -> sc.spawn(() ->
+      val answer = withTimeout(10.seconds, _ -> runOn(host, port, user, command, options)) match
+        Some(Ok(text)) -> text
+        Some(Err(e)) -> s"failed: ${e.message}"
+        None -> "timed out"
+      (host, answer)))
+    threads.map(t -> t.join()))
+
+runOn(host: string, port: int, user: string, command: string, options: Options) -> Result[string, SshError] =
+  val session = Session.connect(host, port, options)?
+  defer _ = session.close()
+  session.authAgent(user)?
+  Ok(session.run(command)?.stdoutText)
+
+@test("the README's first example: uname on a host, logged in with the agent")
+readmeUname()
+  if server() is Some((dir, port, user))
+    val text = made(uname("127.0.0.1", user, port, testOptions(dir) with {connectTimeout = Some(10.seconds)}))
+    assert(text.nonEmpty)
+
+@test("the README's second example: output followed as it arrives, and the exit code")
+readmeFollow()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    assertEq(made(follow(s, "echo out; echo err >&2; exit 5")), 5)
+    assertEq(made(follow(s, "kill -TERM $$")), 128)
+
+@test("the README's third example: one command on several hosts at once, a host that fails among them")
+readmeOnEach()
+  if server() is Some((dir, port, user))
+    val answers = onEach(["127.0.0.1", "localhost", "127.0.0.1"], user, "echo hi", port, testOptions(dir))
+    assertEq(answers.length, 3)
+    for (_, a) in answers do assertEq(a, "hi\n")
+    // A host the server does not listen on fails on its own, the others unaffected.
+    val mixed = onEach(["127.0.0.1", "::1"], user, "echo hi", port, testOptions(dir))
+    assertEq(mixed(0), ("127.0.0.1", "hi\n"))
+    assert(mixed(1).1.startsWith("failed: "))

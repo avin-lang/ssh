@@ -1,0 +1,121 @@
+module tests
+
+// Logging in: a key file, a key under a passphrase, the agent, and every refusal — a key the server
+// does not know, a wrong passphrase, a missing key file, a password the server refuses, an agent that
+// is not there — each naming the methods the server offers.
+import avin.process
+import dev.avinlang.ssh.{Agent, AuthFailed, Invalid, KeyFile, Session}
+
+@test("the server offers publickey, password and keyboard-interactive, asked once per user")
+methods()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    val m = made(s.authMethods(user))
+    assert(m.contains("publickey"))
+    assert(m.contains("password"))
+    assertEq(made(s.authMethods(user)), m)
+
+@test("a key file the server authorizes logs in")
+keyFile()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    made(s.authKey(user, s"$dir/client"))
+    assert(s.isAuthenticated)
+    // Logging in again does nothing.
+    made(s.authKey(user, s"$dir/client"))
+
+@test("a key under a passphrase logs in with it")
+lockedKey()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    made(s.authKey(user, s"$dir/locked", Some("sesame")))
+    assert(s.isAuthenticated)
+
+@test("a wrong passphrase is KeyFile, naming the file")
+wrongPassphrase()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    failure(s.authKey(user, s"$dir/locked", Some("open sesame"))) match
+      KeyFile(path, _) -> assertEq(path, s"$dir/locked")
+      e -> fail(s"expected KeyFile, got ${e.message}")
+    assert(!s.isAuthenticated)
+    // The session goes on: the right one then logs in.
+    made(s.authKey(user, s"$dir/locked", Some("sesame")))
+
+@test("a locked key with no passphrase is KeyFile")
+lockedNoPassphrase()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    assert(failure(s.authKey(user, s"$dir/locked")) is KeyFile(_, _))
+
+@test("a key file that does not exist is KeyFile")
+missingKey()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    assert(failure(s.authKey(user, s"$dir/no_such_key")) is KeyFile(_, _))
+
+@test("a key the server does not authorize is AuthFailed, naming what the server offers")
+strangerKey()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    failure(s.authKey(user, s"$dir/stranger")) match
+      AuthFailed(method, offered) ->
+        assertEq(method, "publickey")
+        assert(offered.contains("publickey"))
+        assert(offered.contains("password"))
+      e -> fail(s"expected AuthFailed, got ${e.message}")
+    assert(!s.isAuthenticated)
+    // Refused once, the session still takes the right key.
+    made(s.authKey(user, s"$dir/client"))
+
+@test("a password the server refuses is AuthFailed, and its message lists the methods offered")
+wrongPassword()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    val e = failure(s.authPassword(user, "not the password"))
+    assert(e is AuthFailed("password", _))
+    assert(e.message.contains("password"))
+    assert(e.message.contains("publickey"))
+    assert(!e.message.contains("not the password"))
+    assert(!e.safeToRetry)
+
+@test("the agent logs in with the key it holds")
+agent()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    made(s.authAgent(user, Some(s"$dir/agent.sock")))
+    assert(s.isAuthenticated)
+
+@test("an agent that is not there is Agent")
+noAgent()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    assert(failure(s.authAgent(user, Some(s"$dir/no_such_agent.sock"))) is Agent(_))
+
+@test("a user the server does not allow is refused whatever the key")
+otherUser()
+  if server() is Some((dir, port, _))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    assert(failure(s.authKey("nobody-at-all", s"$dir/client")) is AuthFailed(_, _))
+
+@test("a user name, password or passphrase holding U+0000 is Invalid, and sends nothing")
+nulArguments()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    assert(failure(s.authKey("a\u0000b", s"$dir/client")) is Invalid(_))
+    assert(failure(s.authKey(user, s"$dir/locked", Some("se\u0000same"))) is Invalid(_))
+    assert(failure(s.authPassword(user, "pa\u0000ss")) is Invalid(_))
+    assert(failure(s.authAgent(user, Some("a\u0000b"))) is Invalid(_))
+    made(s.authKey(user, s"$dir/client"))

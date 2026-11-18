@@ -1,0 +1,78 @@
+module dev.avinlang.ssh
+
+// The session's socket, and the waits on it. libssh2 runs non-blocking: a call that would wait answers
+// `EAGAIN`, `libssh2_session_block_directions` says whether it waits to read, to write or both, and
+// the thread waits for that in a `select` on the descriptor. The runtime's poller watches it, so a
+// lightweight thread parks and its worker runs other threads meanwhile; the wait is a cancellation
+// point, so a `withTimeout` or `withDeadline` around the work, or the cancellation of its scope, ends it.
+import avin.c.Errno
+import avin.threads.{Readiness, Writability}
+import avin.time.Duration
+
+@c(struct: "struct pollfd")
+private data PollFd(fd: int, events: int, revents: int)
+
+@c("int poll(inout struct pollfd *fds, nfds_t nfds, int timeout)")
+private pollRaw(fds: PollFd, count: long, timeout: int) -> (int, PollFd)
+
+@c(const: "POLLIN")
+private val pollIn: int
+
+@c(const: "POLLOUT")
+private val pollOut: int
+
+@c("int dup(int fd)", errno)
+private dupRaw(fd: int) -> Result[int, Errno]
+
+@c("int close(int fd)")
+private closeRaw(fd: int) -> int
+
+// The descriptor a session reads and writes, its own: `dup`ed from the connection's, so that it stays
+// open whatever becomes of the connection's handle, and closed by the session's release.
+private class Socket(val fd: int): Readiness, Writability
+  // Whether a read would answer now: bytes have arrived, the other end has finished or failed.
+  override readable() -> bool = polled(pollIn)
+
+  override readinessDescriptor() -> int = fd
+
+  // Whether a write would send something now, or fail at once.
+  override writable() -> bool = polled(pollOut)
+
+  override writabilityDescriptor() -> int = fd
+
+  // Whether the descriptor is ready for `events` without waiting. A descriptor `poll` cannot look at is
+  // ready, so that the libssh2 call made next reports why.
+  private polled(events: int) -> bool
+    val (n, _) = pollRaw(PollFd(fd, events, 0), 1, 0)
+    n != 0
+
+  // Waits until the socket is ready the way libssh2 last asked, `directions` holding its
+  // `LIBSSH2_SESSION_BLOCK_*` bits (reading where it holds neither), at most `limit` where it is
+  // positive: `true` once ready, `false` where the time ran out first.
+  wait(directions: int, limit: Duration) -> bool
+    val inbound = directions & blockInbound != 0 || directions & blockOutbound == 0
+    val outbound = directions & blockOutbound != 0
+    if limit.micros > 0
+      if inbound && outbound
+        select
+          self.readable() -> true
+          self.writable() -> true
+          after limit -> false
+      elif outbound
+        select
+          self.writable() -> true
+          after limit -> false
+      else
+        select
+          self.readable() -> true
+          after limit -> false
+    elif inbound && outbound
+      select
+        self.readable() -> true
+        self.writable() -> true
+    elif outbound
+      select
+        self.writable() -> true
+    else
+      select
+        self.readable() -> true

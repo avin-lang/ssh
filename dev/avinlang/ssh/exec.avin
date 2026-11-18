@@ -1,0 +1,153 @@
+module dev.avinlang.ssh
+
+// A command running on a session's channel: its output streamed as it arrives, its input written,
+// its exit status read once it ends.
+import avin.io
+import avin.io.IoError
+
+// A piece of a command's output, as it arrived.
+data Chunk
+  Stdout(bytes: Array[byte])
+  Stderr(bytes: Array[byte])
+
+// How a command ended.
+data ExitStatus
+  // It exited with `code`: 0 for success, 127 where the shell found no such command.
+  Exited(code: int)
+  // A signal ended it: `signal` is its name without `SIG` (`TERM`, `KILL`), `message` what the server
+  // said, often nothing.
+  Signalled(signal: string, message: string)
+
+impl ExitStatus
+  // Whether the command exited with 0.
+  success -> bool = self match
+    Exited(0) -> true
+    _ -> false
+
+// What `Session.run` answers: how the command ended, and its output, at most the limit asked for of
+// each stream; `truncated` says whether some was dropped.
+data Output(status: ExitStatus, stdout: Array[byte], stderr: Array[byte], truncated: bool)
+
+impl Output
+  // Whether the command exited with 0.
+  success -> bool = status.success
+
+  // The standard output as text, bytes that are not UTF-8 read as U+FFFD.
+  stdoutText -> string = string.fromUtf8Lossy(stdout)
+
+  // The standard error as text, as `stdoutText`.
+  stderrText -> string = string.fromUtf8Lossy(stderr)
+
+// How much one read of a channel takes at most.
+private val ChunkSize = 32768
+
+// A command running on a channel of a session, made by `Session.exec`. Its output is read a chunk at a
+// time with `next`, each as it arrives, standard output and standard error told apart; `wait` reads
+// what is left and answers the exit status. Its standard input is written with `stdin` (or `write`,
+// as an `io.ByteWriter`), and ended with `closeStdin`.
+//
+// A command belongs to its session's thread. Closing it closes its channel; closing the session closes
+// it, after which every operation answers `Closed`. Output nobody reads is held by libssh2 up to the
+// channel's window, two megabytes, and the server then waits: a command whose input is written while
+// its output is not read stops once that much has come back.
+class Exec(private val link: Link, private val raw: RawChannel, private val mode: StderrMode): io.ByteWriter, io.Close
+  private var closed = false
+  // Whether each stream has ended.
+  private var outDone = false
+  private var errDone = mode match
+    Separate -> false
+    _ -> true
+  private var inputClosed = false
+  // Whether the channel has been closed the protocol's way, both ends agreeing.
+  private var channelClosed = false
+  private var status: Option[ExitStatus] = None
+  private val buffer = Array.fill(ChunkSize, byte(0))
+
+  // Whether the command can still be used: neither it nor its session closed.
+  isOpen -> bool = !closed && link.isOpen
+
+  // The next piece of output, waiting for one, or `None` once both streams have ended. A command
+  // whose standard error was merged or discarded answers only `Stdout`.
+  next() -> Result[Option[Chunk], SshError]
+    usable()?
+    loop
+      if !outDone
+        val n = raw.readInto(0, buffer)
+        if n > 0 then return Ok(Some(Stdout(buffer.slice(0, int(n)))))
+        if n == 0
+          outDone = true
+        elif n != long(eagain)
+          return Err(link.failure(int(n), "read the command's output"))
+      if !errDone
+        val n = raw.readInto(stderrStream, buffer)
+        if n > 0 then return Ok(Some(Stderr(buffer.slice(0, int(n)))))
+        if n == 0
+          errDone = true
+        elif n != long(eagain)
+          return Err(link.failure(int(n), "read the command's output"))
+      if outDone && errDone then return Ok(None)
+      link.await("read the command's output")?
+
+  // Sends all of `bytes` to the command's standard input.
+  stdin(bytes: Array[byte]) -> Result[unit, SshError]
+    usable()?
+    if inputClosed then return Err(Invalid("the command's standard input is closed"))
+    var at = 0
+    while at < bytes.length
+      val piece = if at == 0 then bytes else bytes.slice(at, bytes.length)
+      val n = link.retryingCount("write to the command", () -> raw.writeFrom(0, piece))?
+      if n < 0 then return Err(link.failure(int(n), "write to the command"))
+      at += int(n)
+    Ok(())
+
+  // Sends all of `bytes` to the command's standard input, as `stdin` does, for an `io.ByteWriter`.
+  override write(bytes: Array[byte]) -> Result[unit, IoError] =
+    stdin(bytes).mapErr(e -> asIoError(e, "write to"))
+
+  // Tells the command its standard input has ended. Closing it again does nothing.
+  closeStdin() -> Result[unit, SshError]
+    usable()?
+    if inputClosed then return Ok(())
+    val rc = link.retrying("end the command's input", () -> raw.sendEof())?
+    if rc < 0 then return Err(link.failure(rc, "end the command's input"))
+    inputClosed = true
+    Ok(())
+
+  // Reads the command's output to its end, dropping it, and answers how the command ended. Asked
+  // again, answers the same.
+  wait() -> Result[ExitStatus, SshError]
+    status match
+      Some(s) -> return Ok(s)
+      None -> ()
+    usable()?
+    loop
+      next()? match
+        Some(_) -> ()
+        None -> break
+    if !channelClosed
+      val sent = link.retrying("close the channel", () -> raw.sendClose())?
+      if sent < 0 then return Err(link.failure(sent, "close the channel"))
+      val closedRc = link.retrying("close the channel", () -> raw.waitClosed())?
+      if closedRc < 0 then return Err(link.failure(closedRc, "close the channel"))
+      channelClosed = true
+    val ended = raw.exitSignal() match
+      Ok((Some(signal), _, message, _)) -> Signalled(signal, message.getOrElse(""))
+      _ -> Exited(raw.exitStatus())
+    status = Some(ended)
+    Ok(ended)
+
+  // Closes the command's channel, telling the server, which ends the command if it is still running.
+  // Closing again does nothing, and so does closing a command whose session was closed.
+  override close() -> Result[unit, IoError]
+    if closed then return Ok(())
+    closed = true
+    // The session closed every channel of its own as it closed.
+    if link.closed then return Ok(())
+    link.noteCancelled()
+    link.forget(raw)
+    if channelClosed then _ = raw.close() else link.retire(raw)
+    Ok(())
+
+  private usable() -> Result[unit, SshError]
+    if closed then return Err(Closed)
+    link.usable()
