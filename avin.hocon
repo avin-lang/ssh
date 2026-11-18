@@ -1,8 +1,8 @@
 package {
   name = "ssh"
   version = "0.0.1"
-  description = "An SSH client binding libssh2: sessions over non-blocking sockets that park lightweight threads rather than workers, host keys checked against known_hosts, agent, key and password authentication, and commands with streamed output, standard input and exit status"
-  avin = "0.0.31"
+  description = "An SSH client binding libssh2: sessions over non-blocking sockets that park lightweight threads rather than workers, host keys checked against known_hosts, agent, key and password authentication, commands with streamed output, standard input and exit status, and SFTP transfers"
+  avin = "0.0.32"
 }
 
 dependencies {

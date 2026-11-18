@@ -3,10 +3,10 @@ module tests
 // Running commands: output streamed as it arrives and collected under a limit, exit codes and
 // signals, standard input, several commands on one session, a deadline in the middle of a command,
 // and the session closed under a command.
-import avin.threads.withTimeout
+import avin.threads.{sleep, withTimeout}
 import avin.time.{millis, monotonic, seconds}
 import dev.avinlang.ssh.{
-  Closed, Discard, Exited, Interrupted, Invalid, Merge, Signalled, Stderr, Stdout, TimedOut, Options, Session
+  Closed, Discard, Exited, Interrupted, Invalid, Merge, NotAuthenticated, Signalled, Stderr, Stdout, TimedOut, Options, Session
 }
 
 // Everything `e` prints, standard output and standard error apart, read to the end.
@@ -83,6 +83,20 @@ interleaved()
     assertEq(out, "out1\nout2\nout3\nout4\nout5\n")
     assertEq(err, "err1\nerr2\nerr3\nerr4\nerr5\n")
     assert(made(e.wait()).success)
+
+@test("output already read off the socket for the other stream is never waited for on the socket")
+queuedOutput()
+  if server() is Some((dir, port, user))
+    // Each command's output, standard error, end and exit status come at once; reading one stream
+    // takes them all off the socket. A wait on the socket for what is queued would run into the
+    // session's timeout.
+    val s = made(Session.connect("127.0.0.1", port, testOptions(dir) with {timeout = Some(seconds(5))}))
+    made(s.authKey(user, s"$dir/client"))
+    defer _ = s.close()
+    for i in 0 ..< 300
+      val o = made(s.run(s"echo $i; echo e$i >&2"))
+      assertEq(o.stdoutText, s"$i\n")
+      assertEq(o.stderrText, s"e$i\n")
 
 @test("Merge reads standard error as standard output, Discard drops it")
 stderrModes()
@@ -239,13 +253,92 @@ closeCommand()
   if server() is Some((dir, port, user))
     val s = loggedIn(dir, port, user)
     defer _ = s.close()
-    val e = made(s.exec("sleep 30"))
+    val e = started(s, "sleep 41")
     val began = monotonic()
     assert(e.close().isOk)
     assert(e.close().isOk)
-    assert(monotonic() - began < seconds(6))
+    assert(monotonic() - began < seconds(1))
     assert(failure(e.next()) is Closed)
     assertEq(made(s.run("echo next")).stdoutText, "next\n")
+    // The command was sent TERM, so it is gone.
+    assert(gone(s, "sleep 41"))
+
+@test("closing a command that has finished sends it nothing, and closes at once")
+closeFinished()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = made(s.exec("echo done"))
+    assertEq(drained(e), ("done\n", ""))
+    assert(e.close().isOk)
+    assert(made(s.run("true")).success)
+
+@test("signal sends the command a signal by name, which ends it Signalled")
+signalCommand()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    // The signal goes to the process the server started, so the test waits for it to be running: a
+    // signal that comes before is dropped by the server.
+    val e = started(s, "sleep 42")
+    made(e.signal("KILL"))
+    made(e.wait()) match
+      Signalled(signal, _) -> assertEq(signal, "KILL")
+      other -> fail(s"$other")
+    _ = e.close()
+    val f = made(s.exec("exec sleep 43"))
+    defer _ = f.close()
+    assert(failure(f.signal("")) is Invalid(_))
+    assert(failure(f.signal("SIGTERM ")) is Invalid(_))
+    assert(failure(f.signal("term")) is Invalid(_))
+    assert(f.isOpen)
+
+@test("closing the session sends TERM to the commands still running")
+closeSessionEndsCommands()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    _ = started(s, "sleep 44")
+    _ = started(s, "sleep 44")
+    assert(s.close().isOk)
+    val t = loggedIn(dir, port, user)
+    defer _ = t.close()
+    assert(gone(t, "sleep 44"))
+
+@test("closing a command that ignores TERM does not wait for it, and the session goes on")
+closeIgnoringCommand()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    val e = made(s.exec("trap '' TERM; echo up; sleep 46; echo late"))
+    assert(made(e.next()) is Some(Stdout(_)))
+    val began = monotonic()
+    assert(e.close().isOk)
+    assert(monotonic() - began < seconds(1))
+    assert(failure(e.next()) is Closed)
+    // The session runs commands while the closed one runs on.
+    assertEq(made(s.run("echo next")).stdoutText, "next\n")
+    assertEq(made(s.run("echo again")).stdoutText, "again\n")
+    // And closes at once, the command still running.
+    val closing = monotonic()
+    assert(s.close().isOk)
+    assert(monotonic() - closing < seconds(1))
+    val t = loggedIn(dir, port, user)
+    defer _ = t.close()
+    _ = t.run("pkill -f 'sleep 46'")
+
+// A command started on `s` that prints `up`, then runs `command`, read until `up` has come: the server
+// started it, so a signal sent now reaches it.
+started(s: Session, command: string) -> dev.avinlang.ssh.Exec
+  val e = made(s.exec(s"echo up; exec $command"))
+  assert(made(e.next()) is Some(Stdout(_)))
+  e
+
+// Whether no process running `command` is left on the server, waiting up to two seconds for them to
+// go.
+gone(s: Session, command: string) -> bool
+  for _ in 0 ..< 20
+    if made(s.run(s"pgrep -f -x '$command'")).status is Exited(1) then return true
+    sleep(millis(100))
+  false
 
 @test("a command holding U+0000 is Invalid, and the session goes on")
 nulCommand()
@@ -255,12 +348,19 @@ nulCommand()
     assert(failure(s.exec("echo a\u0000b")) is Invalid(_))
     assert(made(s.run("true")).success)
 
-@test("a command run before logging in is refused")
+@test("a command or SFTP asked for before logging in is NotAuthenticated, at once")
 beforeLogin()
-  if server() is Some((dir, port, _))
+  if server() is Some((dir, port, user))
     val s = connected(dir, port)
     defer _ = s.close()
-    assert(s.run("true").isErr)
+    val began = monotonic()
+    assert(failure(s.run("true")) is NotAuthenticated)
+    assert(failure(s.exec("true")) is NotAuthenticated)
+    assert(failure(s.sftp()) is NotAuthenticated)
+    assert(monotonic() - began < seconds(1))
+    // The session can still log in, and then runs it.
+    made(s.authKey(user, s"$dir/client"))
+    assert(made(s.run("true")).success)
 
 @test("output that is not UTF-8 reads as replacement characters in text, the bytes kept as they are")
 binaryOutput()

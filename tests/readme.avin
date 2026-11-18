@@ -2,6 +2,7 @@ module tests
 
 // The README's examples, against the test server, logged in through the agent `SSH_AUTH_SOCK` names,
 // which `scripts/test-sshd.zsh env` points at the server's own.
+import avin.fs
 import avin.threads.{scope, withTimeout}
 import avin.time.seconds
 import dev.avinlang.ssh.{Exited, Options, Session, Signalled, SshError, Stderr, Stdout}
@@ -51,6 +52,27 @@ runOn(host: string, port: int, user: string, command: string, options: Options) 
   defer _ = session.close()
   session.authAgent(user)?
   Ok(session.run(command)?.stdoutText)
+
+deploy(session: Session, script: string, remote: string) -> Result[int, SshError] =
+  val sftp = session.sftp()?
+  defer _ = sftp.close()
+  sftp.putFile(script, remote, 0o755)?
+  val out = session.run(remote)?
+  sftp.remove(remote)?
+  Ok(if out.success then 0 else 1)
+
+@test("the README's fourth example: a script uploaded, run and removed")
+readmeDeploy()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val t = scratch()
+    defer _ = t.close()
+    local(fs.writeText(s"${t.path}/ok.sh", "#!/bin/sh\nexit 0\n"))
+    local(fs.writeText(s"${t.path}/bad.sh", "#!/bin/sh\nexit 3\n"))
+    assertEq(made(deploy(s, s"${t.path}/ok.sh", s"${t.path}/run-ok")), 0)
+    assertEq(made(deploy(s, s"${t.path}/bad.sh", s"${t.path}/run-bad")), 1)
+    assert(!fs.exists(s"${t.path}/run-ok"))
 
 @test("the README's first example: uname on a host, logged in with the agent")
 readmeUname()

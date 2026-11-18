@@ -148,6 +148,7 @@ class Session(private val link: Link): io.Close
   exec(command: string, stderr: StderrMode = Separate) -> Result[Exec, SshError]
     link.usable()?
     noNul(command, "command")?
+    if !link.raw.authenticated() then return Err(NotAuthenticated)
     val ch = link.channel()?
     var started = false
     defer
@@ -181,6 +182,13 @@ class Session(private val link: Link): io.Close
         None -> break
     val status = e.wait()?
     Ok(Output(status, out.toArray(), err.toArray(), truncated))
+
+  // Starts the SFTP subsystem, to transfer files over. `ChannelRefused` where the server runs none.
+  sftp() -> Result[Sftp, SshError]
+    link.usable()?
+    if !link.raw.authenticated() then return Err(NotAuthenticated)
+    val s = link.sftp()?
+    Ok(Sftp(link, s))
 
   // Closes every command still open, tells the server goodbye and gives the connection back. Closing
   // again does nothing. Waits at most the options' `closeTimeout` for each acknowledgement, and not at

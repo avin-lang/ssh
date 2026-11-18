@@ -32,6 +32,12 @@ data SshError
   Agent(reason: string)
   // The server would not open a channel, run the command or start the subsystem.
   ChannelRefused(reason: string)
+  // The SFTP server refused an operation on the remote `path`: `status` is its SFTP status code (2 no
+  // such file, 3 permission denied, 4 a failure it does not explain), `reason` that code in words.
+  SftpFailed(path: string, status: int, reason: string)
+  // A transfer's local side failed: the `Reader` an upload reads or the `ByteWriter` a download
+  // writes.
+  Local(error: IoError)
   // A wait for the server lasted longer than the session's timeout. The operation it was part of is
   // left unfinished, so the session is unusable afterwards, as after `Interrupted`.
   TimedOut(operation: string)
@@ -39,6 +45,8 @@ data SshError
   Disconnected(reason: string)
   // The session or the command is closed, or the session was closed under the command.
   Closed
+  // A command or SFTP was asked of a session that has not logged in.
+  NotAuthenticated
   // An earlier operation on the session stopped part-way, cancelled or timed out, which leaves the
   // protocol in a state nothing can continue from: close the session and open another.
   Interrupted
@@ -72,16 +80,45 @@ impl Error for SshError
     KeyFile(path, reason) -> s"cannot use the private key $path: $reason"
     Agent(reason) -> s"SSH agent: $reason"
     ChannelRefused(reason) -> s"the server refused the channel: $reason"
+    SftpFailed(path, _, reason) -> s"SFTP: $path: $reason"
+    Local(e) -> e.message
     TimedOut(operation) -> s"timed out waiting to $operation"
     Disconnected(reason) -> s"the connection was lost: $reason"
     Closed -> "the session is closed"
+    NotAuthenticated -> "the session has not logged in"
     Interrupted -> "an earlier operation on the session was interrupted, so it cannot be used"
     Invalid(reason) -> reason
     Failed(code, reason) -> s"libssh2 error $code: $reason"
 
   cause -> Option[Error] = self match
     Connect(e) -> Some(e)
+    Local(e) -> Some(e)
     _ -> None
+
+// An SFTP status code in words.
+private sftpStatusWords(code: int) -> string
+sftpStatusWords(1) = "end of file"
+sftpStatusWords(2) = "no such file"
+sftpStatusWords(3) = "permission denied"
+sftpStatusWords(4) = "the operation failed"
+sftpStatusWords(5) = "bad message"
+sftpStatusWords(6) = "no connection"
+sftpStatusWords(7) = "connection lost"
+sftpStatusWords(8) = "operation not supported"
+sftpStatusWords(9) = "invalid handle"
+sftpStatusWords(10) = "no such path"
+sftpStatusWords(11) = "the file already exists"
+sftpStatusWords(12) = "write protected"
+sftpStatusWords(13) = "no media"
+sftpStatusWords(14) = "no space left on the file system"
+sftpStatusWords(15) = "quota exceeded"
+sftpStatusWords(16) = "unknown principal"
+sftpStatusWords(17) = "lock conflict"
+sftpStatusWords(18) = "the directory is not empty"
+sftpStatusWords(19) = "not a directory"
+sftpStatusWords(20) = "invalid file name"
+sftpStatusWords(21) = "too many symbolic links"
+sftpStatusWords(code) = s"SFTP status $code"
 
 // `host:port`, or the host alone at the usual port.
 private hostName(host: string, port: int) -> string = if port == 22 then host else s"$host:$port"
@@ -93,4 +130,5 @@ private asIoError(e: SshError, operation: string) -> IoError = e match
   TimedOut(_) -> IoError(io.TimedOut, operation, "the SSH channel")
   Disconnected(_) -> IoError(io.ConnectionReset, operation, "the SSH channel")
   Connect(inner) -> inner
+  Local(inner) -> inner
   _ -> IoError(io.Other(e.message), operation, "the SSH channel")

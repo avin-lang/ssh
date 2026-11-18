@@ -1,0 +1,149 @@
+module dev.avinlang.ssh
+
+// File transfer over SFTP: uploads read from any `io.Reader`, downloads written to any
+// `io.ByteWriter`, a piece at a time, so a transfer of any size holds one piece; and the few remote
+// file operations a transfer needs around it.
+import avin.fs
+import avin.io
+import avin.io.IoError
+
+// How much a transfer reads or writes at once, and so the most it holds.
+private val TransferChunk = 65536
+
+// What `Sftp.stat` answers about a remote file: its size in bytes, its permission and type bits as
+// `stat` writes them (`0o100644` for a plain file anyone may read), and when it was last modified, in
+// seconds since 1970. A field the server did not send is 0.
+data RemoteFile(size: long, permissions: int, modified: long)
+
+impl RemoteFile
+  // Whether it is a directory.
+  isDir -> bool = permissions & modeTypeMask == modeDirectory
+
+  // Whether it is a plain file.
+  isFile -> bool = permissions & modeTypeMask == modeRegular
+
+// An SFTP subsystem of a session, made by `Session.sftp`. Files go up with `upload` or `putFile` and
+// come down with `download` or `getFile`, a piece of at most 64 KiB at a time. Every operation waits as
+// the session's do, parking only its own thread.
+//
+// It belongs to its session's thread, as the session does. Closing it ends the subsystem; closing the
+// session closes it, after which every operation answers `Closed`.
+class Sftp(private val link: Link, private val raw: RawSftp): io.Close
+  private var closed = false
+
+  // Whether it can still be used: neither it nor its session closed.
+  isOpen -> bool = !closed && link.isOpen
+
+  // Writes everything `from` gives to the remote file `to`, made with the permission bits `mode` where
+  // it does not exist and emptied first where it does, and answers how many bytes were written.
+  // `SftpFailed` where the server refuses (a missing directory is status 2), `Local` where `from`
+  // fails.
+  upload(from: io.Reader, to: string, mode: int = 0o644) -> Result[long, SshError]
+    usable()?
+    noNul(to, "remote path")?
+    val f = link.openFile(raw, to, fxfWrite | fxfCreate | fxfTruncate, mode)?
+    var finished = false
+    defer
+      if !finished then _ = link.closeFile(f)
+    var total: long = 0
+    loop
+      val piece = from.read(TransferChunk).mapErr(e -> Local(e))?
+      if piece.length == 0 then break
+      var at = 0
+      while at < piece.length
+        val part = if at == 0 then piece else piece.slice(at, piece.length)
+        val n = link.retryingCount("write a remote file", () -> f.writeFrom(part))?
+        if n < 0 then return Err(link.sftpFailure(raw, int(n), to, "write"))
+        at += int(n)
+      total += long(piece.length)
+    finished = true
+    val rc = link.closeFile(f)?
+    if rc < 0 then return Err(link.sftpFailure(raw, rc, to, "close"))
+    Ok(total)
+
+  // Reads the remote file `from` to its end and writes it to `to`, answering how many bytes were read.
+  // `SftpFailed` where the server refuses, `Local` where `to` fails. `to` is neither flushed nor
+  // closed.
+  download(from: string, to: io.ByteWriter) -> Result[long, SshError]
+    usable()?
+    noNul(from, "remote path")?
+    val f = link.openFile(raw, from, fxfRead, 0)?
+    defer _ = link.closeFile(f)
+    val buffer = Array.fill(TransferChunk, byte(0))
+    var total: long = 0
+    loop
+      val n = link.retryingCount("read a remote file", () -> f.readInto(buffer))?
+      if n < 0 then return Err(link.sftpFailure(raw, int(n), from, "read"))
+      if n == 0 then break
+      to.write(buffer.slice(0, int(n))).mapErr(e -> Local(e))?
+      total += n
+    Ok(total)
+
+  // Uploads the local file `local` to the remote `remote`, as `upload` does.
+  putFile(local: string, remote: string, mode: int = 0o644) -> Result[long, SshError]
+    usable()?
+    val source = fs.open(local).mapErr(e -> Local(e))?
+    defer _ = source.close()
+    upload(source, remote, mode)
+
+  // Downloads the remote file `remote` into the local file `local`, made or emptied first, as
+  // `download` does. A local file a failed download began is left as far as it got.
+  getFile(remote: string, local: string) -> Result[long, SshError]
+    usable()?
+    noNul(remote, "remote path")?
+    val sink = fs.create(local).mapErr(e -> Local(e))?
+    defer _ = sink.close()
+    val n = download(remote, sink)?
+    sink.close().mapErr(e -> Local(e))?
+    Ok(n)
+
+  // What the server says of the remote `path`, following a symbolic link. `SftpFailed` with status 2
+  // where there is nothing there.
+  stat(path: string) -> Result[RemoteFile, SshError]
+    usable()?
+    noNul(path, "remote path")?
+    loop
+      val (rc, attrs) = raw.stat(path, long(path.byteLength), sftpStatFollow)
+      if rc == 0
+        val size = if attrs.flags & long(attrSize) != 0 then attrs.filesize else 0
+        val perms = if attrs.flags & long(attrPermissions) != 0 then int(attrs.permissions) else 0
+        val modified = if attrs.flags & long(attrTimes) != 0 then attrs.mtime else 0
+        return Ok(RemoteFile(size, perms, modified))
+      if rc != eagain then return Err(link.sftpFailure(raw, rc, path, "stat"))
+      link.await("read a remote file's attributes")?
+
+  // Makes the remote directory `path` with the permission bits `mode`. `SftpFailed` where it exists or
+  // its parent does not.
+  mkdir(path: string, mode: int = 0o755) -> Result[unit, SshError]
+    usable()?
+    noNul(path, "remote path")?
+    val rc = link.retrying("make a remote directory", () -> raw.mkdir(path, long(path.byteLength), long(mode)))?
+    if rc != 0 then Err(link.sftpFailure(raw, rc, path, "make the directory")) else Ok(())
+
+  // Removes the remote file `path`.
+  remove(path: string) -> Result[unit, SshError]
+    usable()?
+    noNul(path, "remote path")?
+    val rc = link.retrying("remove a remote file", () -> raw.unlink(path, long(path.byteLength)))?
+    if rc != 0 then Err(link.sftpFailure(raw, rc, path, "remove")) else Ok(())
+
+  // Removes the remote directory `path`, which must be empty.
+  removeDir(path: string) -> Result[unit, SshError]
+    usable()?
+    noNul(path, "remote path")?
+    val rc = link.retrying("remove a remote directory", () -> raw.rmdir(path, long(path.byteLength)))?
+    if rc != 0 then Err(link.sftpFailure(raw, rc, path, "remove the directory")) else Ok(())
+
+  // Ends the subsystem, telling the server, at most the session's `closeTimeout`. Closing again does
+  // nothing, and so does closing one whose session was closed.
+  override close() -> Result[unit, IoError]
+    if closed then return Ok(())
+    closed = true
+    if link.closed then return Ok(())
+    link.noteCancelled()
+    link.endSftp(raw)
+    Ok(())
+
+  private usable() -> Result[unit, SshError]
+    if closed then return Err(Closed)
+    link.usable()

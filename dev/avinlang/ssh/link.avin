@@ -21,6 +21,13 @@ private class Link(
   var waiting = false
   // The channels of the commands open on the session, closed before it.
   val channels = Buffer[RawChannel]()
+  // The SFTP subsystems open on the session, and the remote files open through them, closed before it.
+  val sftps = Buffer[RawSftp]()
+  val files = Buffer[RawSftpFile]()
+  // The channels whose close is sent, waiting for the server's.
+  val closing = Buffer[RawChannel]()
+  // Whether the connection was cut, after which every libssh2 call fails at once.
+  var cut = false
   // The user the server was asked about, and the methods it offers that user.
   var offered: Option[(string, Vector[string])] = None
 
@@ -31,7 +38,9 @@ private class Link(
   usable() -> Result[unit, SshError]
     if closed then return Err(Closed)
     noteCancelled()
-    if interrupted then Err(Interrupted) else Ok(())
+    if interrupted then return Err(Interrupted)
+    sweep()
+    Ok(())
 
   // Checks the session belongs to the code running, and marks it interrupted where a wait of it never
   // finished.
@@ -49,7 +58,11 @@ private class Link(
           holdsSocket = true
           return Ok(())
         Err(code) ->
-          if code != eagain then return Err(failure(code, "shake hands with the server"))
+          // Nothing has reached the server but the connection, so every failure here, a reset
+          // connection too, is a `Handshake`, safe to retry.
+          if code != eagain then return Err(failure(code, "shake hands with the server") match
+            Handshake(reason) -> Handshake(reason)
+            other -> Handshake(other.message))
           await("shake hands with the server")?
 
   // Gives everything back at once, with nothing said to the server: for a session that failed before
@@ -60,18 +73,91 @@ private class Link(
     _ = raw.close()
     if !holdsSocket then _ = closeRaw(socket.fd)
 
-  // Closes every command still open, says goodbye to the server unless the session was interrupted,
-  // and gives the session back.
+  // Closes every remote file, SFTP subsystem and command still open, says goodbye to the server unless
+  // the session was interrupted, and gives the session back. What could not be closed the protocol's
+  // way is given back over the connection cut first, so that libssh2 frees it without waiting.
   close()
     if closed then return
     noteCancelled()
     closed = true
+    for f in files.toArray() do _ = closeFile(f)
+    for s in sftps.toArray() do endSftp(s)
+    if interrupted then cutConnection()
     val open = channels.toArray()
     channels.clear()
     for ch in open do retire(ch)
     if !interrupted && holdsSocket
       _ = within("disconnect", options.closeTimeout, () -> raw.disconnect(disconnectByApplication, "closed by the client", ""))
+    if files.nonEmpty || closing.nonEmpty
+      cutConnection()
+      for f in files.toArray()
+        _ = f.closeHandle()
+        _ = f.close()
+      files.clear()
+      for ch in closing.toArray() do _ = ch.close()
+      closing.clear()
+    for s in sftps.toArray() do _ = s.close()
+    sftps.clear()
     _ = raw.close()
+
+  // Shuts the connection down and makes the session blocking, so that every libssh2 call made after
+  // fails at once with the socket's error, freeing what it would have freed on success.
+  cutConnection()
+    if cut || !holdsSocket then return
+    cut = true
+    _ = shutdownRaw(socket.fd, shutBoth)
+    raw.setBlocking(1)
+
+  // A new SFTP subsystem on the session.
+  sftp() -> Result[RawSftp, SshError]
+    loop
+      raw.sftpInit() match
+        Some(s) ->
+          sftps.addOne(s)
+          return Ok(s)
+        None ->
+          val code = raw.lastErrno()
+          if code != eagain then return Err(failure(code, "start SFTP"))
+          await("start SFTP")?
+
+  // Closes the SFTP subsystem `s` the protocol's way, where the session can still talk and no file is
+  // left open: libssh2 frees it then. One left open is freed with the session.
+  endSftp(s: RawSftp)
+    if interrupted || waiting || files.nonEmpty then return
+    val rc = within("close SFTP", options.closeTimeout, () -> s.shutdown())
+    if rc.isOk
+      sftps.filterInPlace(x -> x !== s)
+      _ = s.close()
+
+  // Opens `path` through `s` with the SFTP open `flags`, made with `mode` where it is created.
+  openFile(s: RawSftp, path: string, flags: int, mode: int) -> Result[RawSftpFile, SshError]
+    loop
+      s.open(path, long(path.byteLength), long(flags), long(mode), sftpOpenFile) match
+        Some(f) ->
+          files.addOne(f)
+          return Ok(f)
+        None ->
+          val code = raw.lastErrno()
+          if code != eagain then return Err(sftpFailure(s, code, path, "open"))
+          await("open a remote file")?
+
+  // Closes the remote file `f` the protocol's way, where the session can still talk, at most the
+  // options' `closeTimeout`: `Ok` with what the close answered once libssh2 has freed it. A file whose
+  // close was cut off stays listed, for the session's close to free.
+  closeFile(f: RawSftpFile) -> Result[int, SshError]
+    if interrupted || waiting then return Err(Interrupted)
+    val rc = within("close a remote file", options.closeTimeout, () -> f.closeHandle())?
+    files.filterInPlace(x -> x !== f)
+    _ = f.close()
+    Ok(rc)
+
+  // The error an SFTP call on `path` answering `code` stands for: the server's own status where the
+  // server refused it.
+  sftpFailure(s: RawSftp, code: int, path: string, operation: string) -> SshError
+    if code == sftpProtocol
+      val status = int(s.lastError())
+      return SftpFailed(path, status, sftpStatusWords(status))
+    failure(code, s"$operation $path")
 
   // A new channel, for a command.
   channel() -> Result[RawChannel, SshError]
@@ -83,13 +169,38 @@ private class Link(
           if code != eagain then return Err(failure(code, "open a channel"))
           await("open a channel")?
 
-  // Closes `ch` the protocol's way, where the session can still talk, then gives it back.
+  // Closes `ch` the protocol's way, where the session can still talk, and gives it back; a command
+  // whose output has not ended is sent `TERM` first, since a closed channel alone stops only a command
+  // that writes. The server's own close is not waited for (see `closeSent`).
   retire(ch: RawChannel)
     if !interrupted && !waiting
-      val sent = within("close a channel", options.closeTimeout, () -> ch.sendClose())
-      if sent is Ok(0)
-        _ = within("close a channel", options.closeTimeout, () -> ch.waitClosed())
+      if ch.atEof() == 0
+        _ = within("signal the command", options.closeTimeout, () -> ch.signal("TERM", 4))
+      if !interrupted && !closeSent(ch) then return
     _ = ch.close()
+
+  // Sends `ch` the protocol's close, waiting while libssh2 is still writing it, at most the options'
+  // `closeTimeout`: `true` where the channel is closed, or failed, and can be given back; `false` where
+  // the close is sent and libssh2 waits only for the server's, which comes once the command has exited.
+  // The channel is then kept on `closing`, finished by later operations of the session as the server's
+  // close arrives, and given back by the session's close in any case, so that a command that outlives
+  // its channel never holds up the session.
+  closeSent(ch: RawChannel) -> bool
+    val deadline = monotonic() + options.closeTimeout
+    loop
+      if ch.sendClose() != eagain then return true
+      if raw.blockDirections() & blockOutbound == 0
+        closing.addOne(ch)
+        return false
+      if awaitUntil("close a channel", Some(deadline)).isErr then return true
+
+  // Gives back the channels on `closing` whose server's close has arrived.
+  sweep()
+    if closing.isEmpty || interrupted || waiting then return
+    for ch in closing.toArray()
+      if ch.sendClose() != eagain
+        closing.filterInPlace(c -> c !== ch)
+        _ = ch.close()
 
   // Forgets the channel `ch`, whose command has closed it.
   forget(ch: RawChannel) = channels.filterInPlace(c -> c !== ch)

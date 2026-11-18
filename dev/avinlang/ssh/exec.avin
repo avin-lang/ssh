@@ -86,7 +86,10 @@ class Exec(private val link: Link, private val raw: RawChannel, private val mode
         elif n != long(eagain)
           return Err(link.failure(int(n), "read the command's output"))
       if outDone && errDone then return Ok(None)
-      link.await("read the command's output")?
+      // Reading one stream reads the socket, and may leave the other's data, or the end, in libssh2's
+      // queue rather than on the socket: waiting on the socket then would wait for nothing.
+      if raw.queued(1) == 0 && raw.atEof() == 0
+        link.await("read the command's output")?
 
   // Sends all of `bytes` to the command's standard input.
   stdin(bytes: Array[byte]) -> Result[unit, SshError]
@@ -136,8 +139,19 @@ class Exec(private val link: Link, private val raw: RawChannel, private val mode
     status = Some(ended)
     Ok(ended)
 
-  // Closes the command's channel, telling the server, which ends the command if it is still running.
-  // Closing again does nothing, and so does closing a command whose session was closed.
+  // Sends the command the signal `name`, without `SIG` (`TERM`, `INT`, `KILL`, `HUP`). The server
+  // delivers it to the process it started, the shell running the command; it says nothing back, so a
+  // server that does not deliver signals is not an error here.
+  signal(name: string) -> Result[unit, SshError]
+    usable()?
+    if name.isEmpty || name.exists(c -> !('A' <= c <= 'Z' || '0' <= c <= '9'))
+      return Err(Invalid(s"no signal is named \"$name\""))
+    val rc = link.retrying("signal the command", () -> raw.signal(name, long(name.byteLength)))?
+    if rc < 0 then Err(link.failure(rc, "signal the command")) else Ok(())
+
+  // Closes the command's channel, telling the server, after sending `TERM` to a command whose output
+  // has not ended, which ends it unless it handles the signal. Closing again does nothing, and so does
+  // closing a command whose session was closed.
   override close() -> Result[unit, IoError]
     if closed then return Ok(())
     closed = true

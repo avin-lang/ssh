@@ -168,13 +168,15 @@ closingServer()
   val l = TcpListener.bind("127.0.0.1", 0) match
     Ok(l) -> l
     Err(e) -> fail(e.message)
-  defer _ = l.close()
+  // The listener goes to the thread that accepts on it, which closes it.
+  val port = l.port()
   scope(sc ->
     sc.spawn(() ->
       l.accept() match
         Ok(c) -> _ = c.close()
-        Err(_) -> ())
-    val r = Session.connect("127.0.0.1", l.port(), Options(connectTimeout = Some(seconds(10))))
+        Err(_) -> ()
+      _ = l.close())
+    val r = Session.connect("127.0.0.1", port, Options(connectTimeout = Some(seconds(10))))
     val e = failure(r)
     assert(e is Handshake(_) || e.message.contains("lost"))
     assert(!(e is Connect(_))))
@@ -184,15 +186,17 @@ notSsh()
   val l = TcpListener.bind("127.0.0.1", 0) match
     Ok(l) -> l
     Err(e) -> fail(e.message)
-  defer _ = l.close()
+  // The listener goes to the thread that accepts on it, which closes it.
+  val port = l.port()
   scope(sc ->
     sc.spawn(() ->
       l.accept() match
         Ok(c) ->
           _ = c.writeText("HTTP/1.1 400 Bad Request\r\n\r\n")
           _ = c.close()
-        Err(_) -> ())
-    val r = Session.connect("127.0.0.1", l.port(), Options(connectTimeout = Some(seconds(10))))
+        Err(_) -> ()
+      _ = l.close())
+    val r = Session.connect("127.0.0.1", port, Options(connectTimeout = Some(seconds(10))))
     assert(r.isErr))
 
 @test("the calling thread's deadline bounds connecting as the connect timeout does")

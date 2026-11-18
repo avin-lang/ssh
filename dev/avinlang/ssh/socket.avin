@@ -27,6 +27,12 @@ private dupRaw(fd: int) -> Result[int, Errno]
 @c("int close(int fd)")
 private closeRaw(fd: int) -> int
 
+@c("int shutdown(int fd, int how)")
+private shutdownRaw(fd: int, how: int) -> int
+
+@c(const: "SHUT_RDWR")
+private val shutBoth: int
+
 // The descriptor a session reads and writes, its own: `dup`ed from the connection's, so that it stays
 // open whatever becomes of the connection's handle, and closed by the session's release.
 private class Socket(val fd: int): Readiness, Writability

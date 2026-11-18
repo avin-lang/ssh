@@ -5,8 +5,8 @@ import avin.io
 import avin.io.IoError
 import dev.avinlang.ssh.{
   Agent, AuthFailed, ChangedHostKey, ChannelRefused, Closed, Connect, Disconnected, Exited, Failed, Handshake,
-  Interrupted, Invalid, KeyFile, KnownHosts, Output, Signalled, SshError, TimedOut, UnexpectedHostKey,
-  UnknownHostKey
+  Interrupted, Invalid, KeyFile, KnownHosts, Local, NotAuthenticated, Output, SftpFailed, Signalled, SshError,
+  TimedOut, UnexpectedHostKey, UnknownHostKey
 }
 
 @test("each error says what went wrong in a sentence of its own")
@@ -33,6 +33,29 @@ messages()
   assert(Interrupted.message.contains("interrupted"))
   assertEq(Invalid("bad").message, "bad")
   assertEq(Failed(-34, "invalid").message, "libssh2 error -34: invalid")
+  assertEq(NotAuthenticated.message, "the session has not logged in")
+  assertEq(SftpFailed("/x", 2, "no such file").message, "SFTP: /x: no such file")
+  val full = IoError(io.Other("disk full"), "write", "/tmp/y")
+  assertEq(Local(full).message, full.message)
+
+@test("an SFTP refusal carries the server's status code and the code in words")
+sftpStatuses()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val sftp = made(s.sftp())
+    defer _ = sftp.close()
+    failure(sftp.stat("/no/such/thing")) match
+      SftpFailed(path, 2, reason) ->
+        assertEq(path, "/no/such/thing")
+        assertEq(reason, "no such file")
+      other -> fail(other.message)
+    // Removing a directory that is not empty: the server answers a failure of its own kind.
+    failure(sftp.removeDir("/")) match
+      SftpFailed(_, status, reason) ->
+        assert(status > 0)
+        assert(reason.nonEmpty)
+      other -> fail(other.message)
 
 @test("only a connection's own failures are safe to retry")
 retry()
@@ -41,7 +64,8 @@ retry()
   assert(ChannelRefused("x").safeToRetry)
   val never: Vector[SshError] = [
     UnknownHostKey("h", 22, "f"), ChangedHostKey("h", 22, "f"), AuthFailed("password", []), TimedOut("x"),
-    Disconnected("x"), Closed, Interrupted, Failed(-1, "x")
+    Disconnected("x"), Closed, Interrupted, Failed(-1, "x"), NotAuthenticated, SftpFailed("/x", 2, "x"),
+    Local(IoError(io.Other("x"), "read", "y"))
   ]
   for e in never do assert(!e.safeToRetry)
 
@@ -50,6 +74,8 @@ causes()
   val io = IoError(io.ConnectionRefused, "connect to", "h")
   assertEq(Connect(io).cause.map(c -> c.message), Some(io.message))
   assert(Closed.cause.isEmpty)
+  assertEq(Local(io).cause.map(c -> c.message), Some(io.message))
+  assert(SftpFailed("/x", 2, "x").cause.isEmpty)
 
 @test("an exit status is a success only for code 0")
 exitStatus()

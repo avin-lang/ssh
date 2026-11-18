@@ -144,6 +144,45 @@ private val knownKeyEd25519: int
 @c(const: "LIBSSH2_KNOWNHOST_KEY_UNKNOWN")
 private val knownKeyUnknown: int
 
+@c(const: "LIBSSH2_ERROR_SFTP_PROTOCOL")
+private val sftpProtocol: int
+
+@c(const: "LIBSSH2_FXF_READ")
+private val fxfRead: int
+
+@c(const: "LIBSSH2_FXF_WRITE")
+private val fxfWrite: int
+
+@c(const: "LIBSSH2_FXF_CREAT")
+private val fxfCreate: int
+
+@c(const: "LIBSSH2_FXF_TRUNC")
+private val fxfTruncate: int
+
+@c(const: "LIBSSH2_SFTP_OPENFILE")
+private val sftpOpenFile: int
+
+@c(const: "LIBSSH2_SFTP_STAT")
+private val sftpStatFollow: int
+
+@c(const: "LIBSSH2_SFTP_ATTR_SIZE")
+private val attrSize: int
+
+@c(const: "LIBSSH2_SFTP_ATTR_PERMISSIONS")
+private val attrPermissions: int
+
+@c(const: "LIBSSH2_SFTP_ATTR_ACMODTIME")
+private val attrTimes: int
+
+@c(const: "LIBSSH2_SFTP_S_IFMT")
+private val modeTypeMask: int
+
+@c(const: "LIBSSH2_SFTP_S_IFDIR")
+private val modeDirectory: int
+
+@c(const: "LIBSSH2_SFTP_S_IFREG")
+private val modeRegular: int
+
 // A session. It holds a descriptor of its own, `dup`ed from the connection's, which its release shuts
 // down before freeing the session, so that `libssh2_session_free`, made blocking to finish its work,
 // meets a socket that answers at once rather than one that could keep it waiting on the server; the
@@ -216,14 +255,17 @@ private class RawSession
   @c("LIBSSH2_AGENT *libssh2_agent_init(LIBSSH2_SESSION *self)", keeps: "self")
   agent() -> Option[RawAgent]
 
+  @c("LIBSSH2_SFTP *libssh2_sftp_init(LIBSSH2_SESSION *self)", keeps: "self")
+  sftpInit() -> Option[RawSftp]
+
 @c(
   "LIBSSH2_SESSION *libssh2_session_init_ex(null void *(*my_alloc)(size_t count, void **abstract), null void (*my_free)(void *ptr, void **abstract), null void *(*my_realloc)(void *ptr, size_t count, void **abstract), null void *abstract)"
 )
 private sessionInit() -> Option[RawSession]
 
-// A channel of a session. The package closes it with the protocol's close and waits for the server's
-// before giving the handle back, so that the release's `libssh2_channel_free` has nothing left to say
-// to the server; a channel given back still open sends its close and is freed with its session.
+// A channel of a session. The package sends the protocol's close before giving the handle back, so
+// that the release's `libssh2_channel_free` has nothing left to say to the server and frees it at
+// once; a channel given back still open sends its close, or is freed with its session.
 @c(type: "LIBSSH2_CHANNEL *", kept: "session: RawSession", release: "session ? libssh2_channel_free(self) : 0")
 private class RawChannel
   @c("int libssh2_channel_handle_extended_data2(LIBSSH2_CHANNEL *self, int ignore_mode)")
@@ -246,8 +288,16 @@ private class RawChannel
   @c("int libssh2_channel_eof(LIBSSH2_CHANNEL *self)")
   atEof() -> int
 
+  // Whether data for the channel has been read off the socket and waits in libssh2's queue: standard
+  // output alone where `extended` is 0, standard error too where it is 1.
+  @c("int libssh2_poll_channel_read(LIBSSH2_CHANNEL *self, int extended)")
+  queued(extended: int) -> int
+
   @c("int libssh2_channel_close(LIBSSH2_CHANNEL *self)")
   sendClose() -> int
+
+  @c("int libssh2_channel_signal_ex(LIBSSH2_CHANNEL *self, const char *signame, size_t signame_len)")
+  signal(name: string, nameLength: long) -> int
 
   @c("int libssh2_channel_wait_closed(LIBSSH2_CHANNEL *self)")
   waitClosed() -> int
@@ -307,3 +357,55 @@ private class RawAgent
 // the package uses each only within the one call that read the list, while the agent is open.
 @c(type: "struct libssh2_agent_publickey *", kept: "agent: RawAgent", release: "(void)self, (void)agent")
 private class AgentKey
+
+// The attributes of a remote file, as SFTP sends them; a field counts only where `flags` holds its bit.
+@c(struct: "LIBSSH2_SFTP_ATTRIBUTES")
+private data Attributes(flags: long, filesize: long, uid: long, gid: long, permissions: long, atime: long, mtime: long)
+
+// An SFTP subsystem running on a channel of its session. Its channel belongs to the session, which
+// frees it, and the SFTP state with it, when it is freed itself; `shutdown` closes it earlier, the
+// protocol's way, and frees it then. So giving the handle back frees nothing: the package calls
+// `shutdown` to close it and then closes the handle, which only marks it closed for its files.
+@c(type: "LIBSSH2_SFTP *", kept: "session: RawSession", release: "(void)self, (void)session")
+private class RawSftp
+  @c("int libssh2_sftp_shutdown(LIBSSH2_SFTP *self)")
+  shutdown() -> int
+
+  @c("unsigned long libssh2_sftp_last_error(LIBSSH2_SFTP *self)")
+  lastError() -> long
+
+  @c(
+    "LIBSSH2_SFTP_HANDLE *libssh2_sftp_open_ex(LIBSSH2_SFTP *self, const char *filename, unsigned int filename_len, unsigned long flags, long mode, int open_type)",
+    keeps: "self"
+  )
+  open(path: string, pathLength: long, flags: long, mode: long, openType: int) -> Option[RawSftpFile]
+
+  @c(
+    "int libssh2_sftp_stat_ex(LIBSSH2_SFTP *self, const char *path, unsigned int path_len, int stat_type, out LIBSSH2_SFTP_ATTRIBUTES *attrs)"
+  )
+  stat(path: string, pathLength: long, statType: int) -> (int, Attributes)
+
+  @c("int libssh2_sftp_mkdir_ex(LIBSSH2_SFTP *self, const char *path, unsigned int path_len, long mode)")
+  mkdir(path: string, pathLength: long, mode: long) -> int
+
+  @c("int libssh2_sftp_rmdir_ex(LIBSSH2_SFTP *self, const char *path, unsigned int path_len)")
+  rmdir(path: string, pathLength: long) -> int
+
+  @c("int libssh2_sftp_unlink_ex(LIBSSH2_SFTP *self, const char *filename, unsigned int filename_len)")
+  unlink(path: string, pathLength: long) -> int
+
+// A remote file open through SFTP. libssh2 frees it only in `libssh2_sftp_close_handle`, which talks
+// to the server, so giving the handle back frees nothing: the package closes every file it opens with
+// `closeHandle` (retried while it answers `EAGAIN`; any other answer has freed it) before closing the
+// handle, and a file whose close could not be finished is closed by its session's close, over a
+// connection cut first so that the call fails at once and frees it.
+@c(type: "LIBSSH2_SFTP_HANDLE *", kept: "sftp: RawSftp", release: "(void)self, (void)sftp")
+private class RawSftpFile
+  @c("ssize_t libssh2_sftp_read(LIBSSH2_SFTP_HANDLE *self, char *buffer, length(buffer) size_t buffer_maxlen)")
+  readInto(buffer: Array[byte]) -> long
+
+  @c("ssize_t libssh2_sftp_write(LIBSSH2_SFTP_HANDLE *self, const char *buffer, length(buffer) size_t count)")
+  writeFrom(buffer: Array[byte]) -> long
+
+  @c("int libssh2_sftp_close_handle(LIBSSH2_SFTP_HANDLE *self)")
+  closeHandle() -> int

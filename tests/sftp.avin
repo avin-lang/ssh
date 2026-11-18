@@ -1,0 +1,313 @@
+module tests
+
+// SFTP: uploads and downloads of 0 B, 1 B and 10 MB, streamed from a reader and into a writer that
+// hold one piece at a time, files on both sides, a missing directory and a missing file, the remote
+// operations around a transfer, failures of the local side, and the subsystem closed under it.
+import avin.fs
+import avin.io
+import avin.io.IoError
+import avin.threads.{sleep, withTimeout}
+import avin.time.{millis, monotonic, seconds}
+import dev.avinlang.ssh.{Closed, Interrupted, Invalid, Local, SftpFailed, Session, TimedOut}
+
+// A reader of `size` bytes, byte `i` being `i % 251`, made as they are asked for.
+class Pattern(private val size: long): io.Reader
+  private var at: long = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    val n = if size - at < long(max) then int(size - at) else max
+    val from = at
+    val out = Array.tabulate(n, i -> byte(int((from + long(i)) % 251)))
+    at += long(n)
+    Ok(out)
+
+// A writer that checks what it is given against `Pattern`'s bytes, keeping only a count, and the
+// largest piece it was given.
+class Checker: io.ByteWriter
+  var count: long = 0
+  var largest = 0
+  var wrong = false
+
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    for i in 0 ..< bytes.length
+      if bytes(i) != byte(int((count + long(i)) % 251)) then wrong = true
+    count += long(bytes.length)
+    if bytes.length > largest then largest = bytes.length
+    Ok(())
+
+// A reader that gives a piece, then waits ten seconds before ending.
+class Stalling: io.Reader
+  private var calls = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    calls += 1
+    if calls == 1 then return Ok(Array.fill(1000, byte(7)))
+    sleep(seconds(10))
+    Ok(Array.empty[byte]())
+
+// A reader that fails at once.
+class Broken: io.Reader
+  override read(max: int) -> Result[Array[byte], IoError] = Err(IoError(io.Other("broken"), "read", "test"))
+
+// A writer that fails at once.
+class Refusing: io.ByteWriter
+  override write(bytes: Array[byte]) -> Result[unit, IoError] = Err(IoError(io.Other("full"), "write", "test"))
+
+// A writer that keeps everything.
+class Keeper: io.ByteWriter
+  val kept = Buffer[byte]()
+
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    kept.addAll(bytes)
+    Ok(())
+
+// The value of a local file operation the test expects to succeed.
+local[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A scratch directory, which the test server sees at the same path, being this machine.
+scratch() -> fs.TempDir = local(fs.tempDir("ssh-sftp-test"))
+
+@test("an upload and a download of 0, 1 and 10 MB bytes, streamed a piece at a time")
+roundTrips()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val t = scratch()
+    defer _ = t.close()
+    val sftp = made(s.sftp())
+    defer _ = sftp.close()
+    for size in [long(0), long(1), long(10485760)]
+      val remote = s"${t.path}/up-$size"
+      assertEq(made(sftp.upload(Pattern(size), remote)), size)
+      assertEq(made(sftp.stat(remote)).size, size)
+      val check = Checker()
+      assertEq(made(sftp.download(remote, check)), size)
+      assertEq(check.count, size)
+      assert(!check.wrong)
+      // Memory stays bounded: no piece larger than one transfer's chunk.
+      assert(check.largest <= 65536)
+
+@test("putFile and getFile copy a local file there and back exactly")
+files()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val t = scratch()
+    defer _ = t.close()
+    val sftp = made(s.sftp())
+    defer _ = sftp.close()
+    val data = Array.tabulate(3000000, i -> byte((i * 7) % 256))
+    local(fs.writeBytes(s"${t.path}/local", data))
+    assertEq(made(sftp.putFile(s"${t.path}/local", s"${t.path}/remote")), long(3000000))
+    assertEq(made(sftp.getFile(s"${t.path}/remote", s"${t.path}/back")), long(3000000))
+    assert(local(fs.readBytes(s"${t.path}/back")) == data)
+    // An upload over an existing file replaces it.
+    local(fs.writeText(s"${t.path}/short", "hi"))
+    made(sftp.putFile(s"${t.path}/short", s"${t.path}/remote"))
+    assertEq(local(fs.readText(s"${t.path}/remote")), "hi")
+
+@test("an upload into a missing directory is SftpFailed with status 2, and the session goes on")
+missingDirectory()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val t = scratch()
+    defer _ = t.close()
+    val sftp = made(s.sftp())
+    defer _ = sftp.close()
+    val remote = s"${t.path}/no/such/dir/file"
+    failure(sftp.upload(Pattern(10), remote)) match
+      SftpFailed(p, 2, reason) ->
+        assertEq(p, remote)
+        assertEq(reason, "no such file")
+      other -> fail(other.message)
+    assertEq(made(sftp.upload(Pattern(10), s"${t.path}/fine")), long(10))
+    assert(made(s.run("true")).success)
+
+@test("a download of a missing file is SftpFailed with status 2, writing nothing")
+missingFile()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val sftp = made(s.sftp())
+    defer _ = sftp.close()
+    val k = Keeper()
+    assert(failure(sftp.download("/no/such/file/anywhere", k)) is SftpFailed(_, 2, _))
+    assertEq(k.kept.length, 0)
+    assert(failure(sftp.stat("/no/such/file/anywhere")) is SftpFailed(_, 2, _))
+    assert(failure(sftp.remove("/no/such/file/anywhere")) is SftpFailed(_, 2, _))
+
+@test("mkdir, stat, remove and removeDir")
+remoteOperations()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val t = scratch()
+    defer _ = t.close()
+    val sftp = made(s.sftp())
+    defer _ = sftp.close()
+    val d = s"${t.path}/sub"
+    made(sftp.mkdir(d, 0o700))
+    val info = made(sftp.stat(d))
+    assert(info.isDir)
+    assert(!info.isFile)
+    assertEq(info.permissions & 0o777, 0o700)
+    assert(info.modified > 0)
+    // Making it again fails: it exists.
+    assert(failure(sftp.mkdir(d)) is SftpFailed(_, _, _))
+    made(sftp.upload(Pattern(5), s"$d/f", 0o600))
+    val f = made(sftp.stat(s"$d/f"))
+    assert(f.isFile)
+    assertEq(f.size, long(5))
+    assertEq(f.permissions & 0o777, 0o600)
+    // A directory holding a file cannot be removed.
+    assert(failure(sftp.removeDir(d)) is SftpFailed(_, _, _))
+    made(sftp.remove(s"$d/f"))
+    made(sftp.removeDir(d))
+    assert(!fs.exists(d))
+
+@test("a failing local side is Local, and the subsystem goes on")
+localFailures()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val t = scratch()
+    defer _ = t.close()
+    val sftp = made(s.sftp())
+    defer _ = sftp.close()
+    assert(failure(sftp.upload(Broken(), s"${t.path}/x")) is Local(_))
+    made(sftp.upload(Pattern(100000), s"${t.path}/y"))
+    assert(failure(sftp.download(s"${t.path}/y", Refusing())) is Local(_))
+    assert(failure(sftp.putFile(s"${t.path}/missing-local", s"${t.path}/z")) is Local(_))
+    assert(failure(sftp.getFile(s"${t.path}/y", s"${t.path}/no/dir/here")) is Local(_))
+    assertEq(made(sftp.stat(s"${t.path}/y")).size, long(100000))
+    assert(sftp.isOpen)
+
+@test("paths holding U+0000 are refused before anything is sent")
+nulPaths()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val sftp = made(s.sftp())
+    defer _ = sftp.close()
+    assert(failure(sftp.stat("a\u0000b")) is Invalid(_))
+    assert(failure(sftp.upload(Pattern(1), "a\u0000b")) is Invalid(_))
+    assert(failure(sftp.mkdir("a\u0000b")) is Invalid(_))
+    assert(sftp.isOpen)
+
+@test("an Sftp used after it or its session closed answers Closed")
+closedUse()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    val a = made(s.sftp())
+    local(a.close())
+    assert(!a.isOpen)
+    assert(failure(a.stat("/")) is Closed)
+    // Closing again does nothing.
+    local(a.close())
+    val b = made(s.sftp())
+    assert(made(b.stat("/")).isDir)
+    local(s.close())
+    assert(!b.isOpen)
+    assert(failure(b.stat("/")) is Closed)
+    assert(failure(b.upload(Pattern(1), "/tmp/x")) is Closed)
+    local(b.close())
+
+@test("two SFTP subsystems and a command share one session")
+shared()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val t = scratch()
+    defer _ = t.close()
+    val a = made(s.sftp())
+    val b = made(s.sftp())
+    made(a.upload(Pattern(70000), s"${t.path}/a"))
+    val c = Checker()
+    made(b.download(s"${t.path}/a", c))
+    assertEq(c.count, long(70000))
+    assert(!c.wrong)
+    assertEq(made(s.run(s"wc -c < ${t.path}/a")).stdoutText.trim, "70000")
+    local(a.close())
+    assert(made(b.stat(s"${t.path}/a")).isFile)
+
+@test("a deadline in the middle of an upload interrupts the session, and closing it frees the open file at once")
+deadlineMidUpload()
+  if server() is Some((dir, port, user))
+    val t = scratch()
+    defer _ = t.close()
+    val s = loggedIn(dir, port, user)
+    val sftp = made(s.sftp())
+    // The deadline falls while the local reader waits, between two calls of libssh2: the upload closes
+    // its remote file on the way out, and the session goes on.
+    assertEq(withTimeout(millis(300), _ -> sftp.upload(Stalling(), s"${t.path}/big").isOk), None)
+    if s.isOpen
+      assert(sftp.isOpen)
+      assert(made(s.run("true")).success)
+      assertEq(made(sftp.stat(s"${t.path}/big")).size, long(1000))
+    else
+      assert(failure(s.run("true")) is Interrupted)
+    val closing = monotonic()
+    local(s.close())
+    assert(monotonic() - closing < seconds(2))
+    assert(failure(sftp.stat("/")) is Closed)
+    local(sftp.close())
+
+@test("the session's timeout in the middle of an upload leaves the file open, and closing the session frees it at once")
+timeoutMidUpload()
+  if server() is Some((dir, port, user))
+    val t = scratch()
+    defer _ = t.close()
+    val fifo = s"${t.path}/fifo"
+    // A reader that holds the pipe open and never reads: the server's writes stop once the pipe is
+    // full, and then the channel's window fills.
+    val other = loggedIn(dir, port, user)
+    assert(made(other.run(s"mkfifo $fifo")).success)
+    val holder = made(other.exec(s"echo up; exec sleep 47 < $fifo"))
+    val s = made(Session.connect("127.0.0.1", port, testOptions(dir) with {timeout = Some(millis(500))}))
+    made(s.authKey(user, s"$dir/client"))
+    val sftp = made(s.sftp())
+    failure(sftp.upload(Pattern(long(1) << 30), fifo)) match
+      TimedOut(_) -> ()
+      other -> fail(other.message)
+    assert(!s.isOpen)
+    assert(failure(sftp.stat("/")) is Interrupted)
+    val closing = monotonic()
+    local(s.close())
+    assert(monotonic() - closing < seconds(2))
+    assert(failure(sftp.stat("/")) is Closed)
+    // Ending the reader lets the server's SFTP process, blocked writing the pipe, finish.
+    _ = holder.close()
+    _ = other.run("pkill -f 'sleep 47'")
+    local(other.close())
+
+@test("the session's timeout in the middle of a download is TimedOut, and the session closes at once")
+timeoutMidDownload()
+  if server() is Some((dir, port, user))
+    val s = made(Session.connect("127.0.0.1", port, testOptions(dir) with {timeout = Some(millis(300))}))
+    made(s.authKey(user, s"$dir/client"))
+    val sftp = made(s.sftp())
+    // A named pipe nothing writes: its read never answers.
+    val t = scratch()
+    defer _ = t.close()
+    assert(made(s.run(s"mkfifo ${t.path}/fifo")).success)
+    assert(failure(sftp.download(s"${t.path}/fifo", Keeper())) is TimedOut(_))
+    assert(failure(sftp.stat("/")) is Interrupted)
+    val closing = monotonic()
+    local(s.close())
+    assert(monotonic() - closing < seconds(2))
+    // Opening the pipe for writing lets the server's SFTP process, still waiting to open it, finish.
+    local(local(fs.append(s"${t.path}/fifo")).close())
+
+@test("sessions collected with SFTP subsystems open free them; sessions made after still work")
+sftpCollected()
+  if server() is Some((dir, port, user))
+    for _ in 0 ..< 20
+      val s = loggedIn(dir, port, user)
+      val sftp = made(s.sftp())
+      assert(made(sftp.stat("/")).isDir)
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    assert(made(made(s.sftp()).stat("/")).isDir)

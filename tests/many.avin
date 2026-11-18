@@ -2,14 +2,29 @@ module tests
 
 // Many sessions at once on lightweight threads, one each, against the one server; sessions nobody
 // closed, given back by the collector; and a session's ownership, which belongs to one thread.
-import avin.threads.scope
-import avin.time.{monotonic, seconds}
+import avin.threads.{Mutex, scope, sleep}
+import avin.time.{millis, monotonic, seconds}
 import dev.avinlang.ssh.Session
+
+// How many connections were tried again.
+private val retried: Mutex[int] = Mutex(0)
+
+// A session with the server, tried again, as a fan-out does, while the failure is safe to retry: two
+// hundred connections at once overflow the listening socket's queue of 128 here, and the kernel resets
+// a connection it dropped from it, which the client sees as a handshake that failed.
+private connectRetrying(dir: string, port: int) -> Result[Session, dev.avinlang.ssh.SshError]
+  var attempt = 0
+  loop
+    val r = Session.connect("127.0.0.1", port, testOptions(dir))
+    if r.isOk || attempt == 5 || !r.err.exists(e -> e.safeToRetry) then return r
+    attempt += 1
+    _ = retried.update((n: int) -> n + 1)
+    sleep(millis(long(20 * attempt)))
 
 // What one thread does: connects, logs in, runs a command and closes, answering what the command
 // printed or what failed.
 private oneSession(dir: string, port: int, user: string, i: int) -> string
-  Session.connect("127.0.0.1", port, testOptions(dir)) match
+  connectRetrying(dir, port) match
     Err(e) -> s"connect: ${e.message}"
     Ok(s) ->
       defer _ = s.close()
@@ -29,7 +44,7 @@ twoHundred()
       threads.map(t -> t.join()))
     val took = monotonic() - began
     for i in 0 ..< 200 do assertEq(answers(i), s"$i")
-    println(s"200 sessions took $took")
+    println(s"200 sessions took $took, ${retried.get()} connections tried again")
     assert(took < seconds(120))
 
 @test("sessions and commands nobody closed are given back by the collector, commands first")

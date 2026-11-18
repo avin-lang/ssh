@@ -106,13 +106,27 @@ runOn(host: string, port: int, user: string, command: string, options: Options) 
   Ok(session.run(command)?.stdoutText)
 ```
 
+A script uploaded over SFTP, then run; a transfer holds one 64 KiB piece at a time, whatever its size:
+
+```avin
+import dev.avinlang.ssh.{Session, SshError}
+
+deploy(session: Session, script: string, remote: string) -> Result[int, SshError] =
+  val sftp = session.sftp()?
+  defer _ = sftp.close()
+  sftp.putFile(script, remote, 0o755)?
+  val out = session.run(remote)?
+  sftp.remove(remote)?
+  Ok(if out.success then 0 else 1)
+```
+
 ## What is bound
 
 - **Sessions**: `Session.connect(host, port, options)` makes the TCP connection, shakes hands and
   checks the host key; `Options` set the connect timeout (connection, handshake and host key
   together), the timeout of every later wait, the host-key policy, the known-hosts file, keepalives
-  and how long `close` waits. A session is an `io.Close`: `close()` closes every command still open,
-  says goodbye and gives the connection back.
+  and how long `close` waits. A session is an `io.Close`: `close()` closes every command and SFTP
+  subsystem still open, says goodbye and gives the connection back.
 - **Host keys**: `HostKeys.Strict` (the default) takes only a key the known-hosts file lists for the
   host and port, `AcceptNew` adds a host it does not list to the file, and `Pinned(fingerprint)`
   takes exactly the key with that SHA-256 fingerprint. A key the file does not list is
@@ -128,6 +142,11 @@ runOn(host: string, port: int, user: string, command: string, options: Options) 
   `Signalled(signal, message)`, and `close()` ends it. Several run on one session at once.
   `run(command, limit)` runs one to its end and answers an `Output` with at most `limit` bytes of each
   stream kept.
+- **SFTP**: `sftp()` starts the subsystem; `upload(reader, remotePath, mode)` and
+  `download(remotePath, writer)` stream any `io.Reader` up and into any `io.ByteWriter`, and
+  `putFile`/`getFile` do the same between local and remote files. `stat`, `mkdir`, `remove` and
+  `removeDir` work on remote paths. The server's refusal is `SftpFailed(path, status, reason)` (a
+  missing file or directory is status 2); a failing local side is `Local(ioError)`.
 - **Errors**: every failure is an `SshError`; `safeToRetry` says which came before anything but the
   connection's own setting up reached the server.
 

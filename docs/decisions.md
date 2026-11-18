@@ -81,7 +81,9 @@ takes passwords through `password` too, so it adds little now).
 ## Errors: one `SshError`; `safeToRetry` only where nothing reached the server
 
 `Connect`, `Handshake` and `ChannelRefused` came before any command or transfer reached the server,
-so trying again cannot run anything twice; nothing else is marked safe.
+so trying again cannot run anything twice; nothing else is marked safe. `SftpFailed` and `Local` are
+not marked either, though an SFTP refusal usually changed nothing: whether a retry is sound depends on
+what the program was transferring.
 
 ## A session closes its commands first; a command after its session closed answers `Closed`
 
@@ -92,6 +94,55 @@ goodbye, and every operation of a command checks its session first. A command's 
 its session until one of them is closed, not collected on its own while the session lives.
 **Review with the user**: a program that drops commands without closing them holds their channels
 until the session closes.
+
+## SFTP transfers stream through `io.Reader` and `io.ByteWriter`, 64 KiB at a time
+
+`upload(reader, remote, mode)` and `download(remote, writer)` move one piece of at most 64 KiB at a
+time, so a transfer of any size holds one piece; `putFile` and `getFile` wrap them around local files.
+An upload creates or empties the remote file (`CREAT | TRUNC`). Around them only what a runner needs:
+`stat`, `mkdir`, `remove`, `removeDir`. The server's refusal is `SftpFailed(path, status, reason)`
+with the SFTP status code; the local side's failure is `Local(IoError)`. *Alternatives*: a remote
+`File` handle that is itself a `Reader`/`ByteWriter` (more surface, and every handle a program holds is
+one more thing the session must close); SCP (the server here runs SFTP, and SCP gives no status).
+**Review with the user**: whether a remote file handle, rename, symlinks and directory listing belong
+in the package now or when the runner needs them.
+
+## Remote files and SFTP subsystems are freed by the session, never by the collector
+
+libssh2 frees an SFTP file handle only in `libssh2_sftp_close_handle`, which talks to the server, and
+an SFTP subsystem's state goes with its channel when the session is freed. So neither handle's release
+frees anything: every transfer closes its file the protocol's way (at most `closeTimeout`), and a file
+whose close was cut off, by a timeout or a cancellation, stays on the session's list. The session's
+`close` then shuts the socket down and makes libssh2 blocking before closing it, so the call fails at
+once and frees the file; an SFTP subsystem left open is freed with the session. The same cut makes
+an interrupted session's channels free at once rather than wait. *Alternatives*: closing the handle in
+the release (a finalizer that waits on the server, or one that cannot finish non-blocking and leaks);
+freeing nothing until the session is collected (a closed session would leak its interrupted files).
+
+## Closing a running command sends it `TERM`, and nothing waits for the server's close
+
+A closed channel stops only a command that writes (it meets a closed pipe); `sleep 30` would run on.
+So closing a command whose output has not ended, by `Exec.close` or by the session's `close`, first
+sends the `signal` request `TERM`, then the protocol's close, and frees the channel without waiting
+for the server's own close, which comes only once the command has exited and which libssh2 drops for
+a freed channel. `Exec.signal(name)` sends any signal. *Alternatives*: waiting for the server's
+close (a command that ignores the channel kept `close` waiting its whole `closeTimeout`, and then
+left the session interrupted); `KILL` (gives the command no chance to clean up). **Review with the
+user**: `TERM` reaches the process the server started, the user's shell; a shell that does not hand
+it on leaves its children running.
+
+## A command or SFTP before logging in is `NotAuthenticated`, at once
+
+OpenSSH answers a channel opened before a login with nothing at all, so the request waited out the
+session's whole timeout. `exec`, `run` and `sftp` check `libssh2_userauth_authenticated` first.
+
+## Every failure of the handshake is `Handshake`, safe to retry
+
+A connection reset before the server's banner arrived (a listening queue overflowing drops
+connections that way) failed as `Disconnected`, which is not safe to retry, though nothing but the
+connection had reached the server. Every failure inside the handshake but a timeout is now
+`Handshake(reason)`, the reason keeping libssh2's words. The 200-session test retries such failures
+as a fan-out would: two hundred connections at once to one `sshd` overflow its listen queue of 128.
 
 ## The session and its commands share a module-private `Link`
 
