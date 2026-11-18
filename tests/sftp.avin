@@ -260,27 +260,27 @@ timeoutMidUpload()
   if server() is Some((dir, port, user))
     val t = scratch()
     defer _ = t.close()
-    val fifo = s"${t.path}/fifo"
-    // A reader that holds the pipe open and never reads: the server's writes stop once the pipe is
-    // full, and then the channel's window fills.
+    // The server's SFTP process, stopped once the subsystem starts, reads nothing more: the channel's
+    // window fills and the upload's next write waits until the deadline. (A named pipe cannot stand in
+    // for it: the server seeks before every write, which a pipe refuses, so the write fails at once.)
     val other = loggedIn(dir, port, user)
-    assert(made(other.run(s"mkfifo $fifo")).success)
-    val holder = made(other.exec(s"echo up; exec sleep 47 < $fifo"))
     val s = made(Session.connect("127.0.0.1", port, testOptions(dir) with {timeout = Some(millis(500))}))
     made(s.authKey(user, s"$dir/client"))
     val sftp = made(s.sftp())
-    failure(sftp.upload(Pattern(long(1) << 30), fifo)) match
+    val server = made(other.run("pgrep -n -x sftp-server")).stdoutText.trim
+    assert(!server.isEmpty)
+    assert(made(other.run(s"kill -STOP $server")).success)
+    failure(sftp.upload(Pattern(long(1) << 30), s"${t.path}/big")) match
       TimedOut(_) -> ()
-      other -> fail(other.message)
+      e -> fail(e.message)
     assert(!s.isOpen)
     assert(failure(sftp.stat("/")) is Interrupted)
     val closing = monotonic()
     local(s.close())
     assert(monotonic() - closing < seconds(2))
     assert(failure(sftp.stat("/")) is Closed)
-    // Ending the reader lets the server's SFTP process, blocked writing the pipe, finish.
-    _ = holder.close()
-    _ = other.run("pkill -f 'sleep 47'")
+    // Ending the stopped SFTP process lets the server finish the session.
+    _ = other.run(s"kill -KILL $server")
     local(other.close())
 
 @test("the session's timeout in the middle of a download is TimedOut, and the session closes at once")
