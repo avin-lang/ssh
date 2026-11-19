@@ -1,0 +1,313 @@
+module tests
+
+// Tunnels (`direct-tcpip`): bytes both ways to an echo server the test runs, a big transfer through
+// the `io` traits, a port nobody listens on, forwarding the server forbids, several tunnels at once,
+// a cancellation mid-stream, the session closed under a tunnel, and the relay that joins a tunnel to a
+// local connection.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Scope, scope, withTimeout}
+import avin.time.{millis, monotonic, seconds}
+import dev.avinlang.ssh.{ChannelRefused, Closed, Interrupted, Invalid, NotAuthenticated, Tunnel}
+
+// The value of a local network operation the test expects to succeed.
+net[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Sends back everything `conn` sends, until it finishes sending, then finishes too.
+echoing(conn: TcpStream)
+  loop
+    conn.read(65536) match
+      Ok(bytes) if bytes.nonEmpty -> if conn.write(bytes).isErr then break
+      _ -> break
+  _ = conn.shutdownOutput()
+  _ = conn.close()
+
+// Takes connections on `listener`, each echoed on a thread of its own, until cancelled.
+serving(listener: TcpListener) = scope(inner -> accepting(inner, listener))
+
+accepting(inner: Scope, listener: TcpListener)
+  loop
+    listener.accept() match
+      Ok(conn) -> _ = inner.spawn(() -> echoing(conn))
+      Err(_) -> break
+
+// Runs `body` with the port of an echo server on 127.0.0.1, which stops once it returns.
+withEcho(sc: Scope, body: (int) -> unit)
+  val listener = net(TcpListener.bind("127.0.0.1", 0))
+  val port = listener.port()
+  _ = sc.spawn(() -> serving(listener))
+  body(port)
+  sc.cancel()
+
+// Exactly `n` bytes from `t`, read as they come; fails where it ends first.
+exactly(t: Tunnel, n: int) -> Array[byte]
+  val got = Buffer[byte]()
+  while got.length < n
+    val piece = made(t.receive())
+    if piece.isEmpty then fail(s"the tunnel ended after ${got.length} of $n bytes")
+    got.addAll(piece)
+  got.toArray()
+
+// A port of 127.0.0.1 that nothing listens on.
+closedPort() -> int
+  val l = net(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  _ = l.close()
+  port
+
+@test("bytes written to a tunnel reach the host, its answer is read back, and closeWrite ends it")
+roundTrip()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      defer _ = s.close()
+      val t = made(s.tunnel("127.0.0.1", echo))
+      defer _ = t.close()
+      assertEq(t.host, "127.0.0.1")
+      assertEq(t.port, echo)
+      assert(t.isOpen)
+      made(t.send("hello".utf8))
+      assertEq(string.fromUtf8Lossy(exactly(t, 5)), "hello")
+      made(t.send(Array.empty[byte]()))
+      made(t.closeWrite())
+      made(t.closeWrite())
+      assertEq(made(t.receive()).length, 0)
+      assertEq(made(t.receive()).length, 0)
+      assert(failure(t.send("late".utf8)) is Invalid(_))
+      // The session goes on beside it.
+      assertEq(made(s.run("echo beside")).stdoutText, "beside\n")))
+
+@test("four megabytes go through a tunnel and back through its io traits, in pieces")
+bigTransfer()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      defer _ = s.close()
+      val t = made(s.tunnel("localhost", echo))
+      defer _ = t.close()
+      val piece = 65536
+      var total = 0
+      for k in 0 ..< 64
+        val out = Array.tabulate(piece, i -> byte((k * piece + i) % 251))
+        assert(t.write(out).isOk)
+        val back = Buffer[byte]()
+        while back.length < piece
+          val got = net(t.read(piece - back.length))
+          assert(got.nonEmpty)
+          assert(got.length <= piece - back.length)
+          back.addAll(got)
+        assert(back.toArray().toVector == out.toVector)
+        total += back.length
+      assertEq(total, 4194304)
+      made(t.closeWrite())
+      assertEq(net(t.read(10)).length, 0)))
+
+@test("a tunnel to a port nobody listens on is ChannelRefused, safe to retry, and the session goes on")
+refusedPort()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = failure(s.tunnel("127.0.0.1", closedPort()))
+    assert(e is ChannelRefused(_))
+    assert(e.safeToRetry)
+    assert(e.message.nonEmpty)
+    assert(s.isOpen)
+    assertEq(made(s.run("echo after")).stdoutText, "after\n")
+
+@test("forwarding the server forbids for the key is ChannelRefused")
+forbidden()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = connected(dir, port)
+      defer _ = s.close()
+      made(s.authKey(user, s"$dir/restricted"))
+      assert(failure(s.tunnel("127.0.0.1", echo)) is ChannelRefused(_))
+      assert(made(s.run("true")).success)))
+
+@test("several tunnels run on one session at once, each read in turn, beside a command")
+severalTunnels()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      defer _ = s.close()
+      val tunnels = Buffer[Tunnel]()
+      for i in 0 ..< 6
+        tunnels.addOne(made(s.tunnel("127.0.0.1", echo)))
+      val cmd = made(s.exec("sleep 0.2; echo command"))
+      for i in 0 ..< 6
+        made(tunnels(i).send(s"message $i".utf8))
+      // Last first: the others' answers wait in libssh2 meanwhile.
+      var i = 5
+      while i >= 0
+        assertEq(string.fromUtf8Lossy(exactly(tunnels(i), 9)), s"message $i")
+        i -= 1
+      assertEq(made(s.run("echo between")).stdoutText, "between\n")
+      for t in tunnels
+        made(t.closeWrite())
+        assertEq(made(t.receive()).length, 0)
+        assert(t.close().isOk)
+      assert(made(cmd.wait()).success)
+      _ = cmd.close()))
+
+@test("a cancellation in the middle of a tunnel's read stops it, and leaves the session Interrupted")
+cancelMidStream()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      val t = made(s.tunnel("127.0.0.1", echo))
+      made(t.send("x".utf8))
+      assertEq(exactly(t, 1).length, 1)
+      val began = monotonic()
+      // The echo server sends nothing more until it is sent something.
+      assertEq(withTimeout(millis(300), _ -> t.receive().isOk), None)
+      assert(monotonic() - began < seconds(3))
+      assert(!t.isOpen)
+      assert(failure(t.receive()) is Interrupted)
+      assert(failure(t.send("y".utf8)) is Interrupted)
+      assert(failure(s.tunnel("127.0.0.1", echo)) is Interrupted)
+      val closing = monotonic()
+      assert(t.close().isOk)
+      assert(s.close().isOk)
+      assert(monotonic() - closing < seconds(2))))
+
+@test("closing the session under an open tunnel closes it, and the tunnel answers Closed")
+closeUnderTunnel()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      val t = made(s.tunnel("127.0.0.1", echo))
+      assert(s.close().isOk)
+      assert(!t.isOpen)
+      assert(failure(t.receive()) is Closed)
+      assert(failure(t.send("x".utf8)) is Closed)
+      assert(failure(t.closeWrite()) is Closed)
+      assert(t.close().isOk)
+      assert(t.close().isOk)))
+
+@test("a tunnel closed early leaves the session going, and a closed tunnel answers Closed")
+closeTunnel()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      defer _ = s.close()
+      val t = made(s.tunnel("127.0.0.1", echo))
+      made(t.send("unread".utf8))
+      assert(t.close().isOk)
+      assert(failure(t.receive()) is Closed)
+      assert(failure(t.relay(net(TcpStream.connect("127.0.0.1", echo)))) is Closed)
+      val again = made(s.tunnel("127.0.0.1", echo))
+      made(again.send("ok".utf8))
+      assertEq(string.fromUtf8Lossy(exactly(again, 2)), "ok")
+      _ = again.close()))
+
+@test("a tunnel's host, port or read size that cannot be used is Invalid; before logging in NotAuthenticated")
+invalidTunnel()
+  if server() is Some((dir, port, user))
+    val fresh = connected(dir, port)
+    assert(failure(fresh.tunnel("127.0.0.1", 22)) is NotAuthenticated)
+    _ = fresh.close()
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      defer _ = s.close()
+      assert(failure(s.tunnel("127.0.0.1", -1)) is Invalid(_))
+      assert(failure(s.tunnel("127.0.0.1", 65536)) is Invalid(_))
+      assert(failure(s.tunnel("local\u0000host", echo)) is Invalid(_))
+      val t = made(s.tunnel("127.0.0.1", echo))
+      assert(failure(t.receive(0)) is Invalid(_))
+      made(t.send("abc".utf8))
+      // A read of one byte at a time takes one.
+      assertEq(made(t.receive(1)).length, 1)
+      assertEq(exactly(t, 2).length, 2)
+      _ = t.close()))
+
+@test("relay joins a tunnel to a local connection both ways until both finish, a megabyte each way")
+relay()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      defer _ = s.close()
+      val local = net(TcpListener.bind("127.0.0.1", 0))
+      val localPort = local.port()
+      val size = 1048576
+      // A client that writes a megabyte from one thread and reads what comes back on another.
+      val client = sc.spawn(() ->
+        val conn = net(TcpStream.connect("127.0.0.1", localPort))
+        val (r, w) = conn.split()
+        scope(cs ->
+          val writer = cs.spawn(() ->
+            for k in 0 ..< 16
+              _ = w.write(Array.tabulate(65536, i -> byte((k * 65536 + i) % 251)))
+            // Closing the writing half tells the other end nothing more is coming.
+            _ = w.close()
+            ())
+          var count = 0
+          var right = true
+          loop
+            r.read(65536) match
+              Ok(bytes) if bytes.nonEmpty ->
+                for i in 0 ..< bytes.length
+                  if bytes(i) != byte((count + i) % 251) then right = false
+                count += bytes.length
+              _ -> break
+          writer.join()
+          _ = r.close()
+          (count, right)))
+      val conn = net(local.accept())
+      _ = local.close()
+      val t = made(s.tunnel("127.0.0.1", echo))
+      assertEq(made(t.relay(conn)), (long(size), long(size)))
+      assertEq(client.join(), (size, true))
+      _ = conn.close()
+      // The tunnel has ended both ways.
+      assertEq(made(t.receive()).length, 0)
+      _ = t.close()
+      assertEq(made(s.run("echo after")).stdoutText, "after\n")))
+
+@test("a relay whose local connection ends at once passes the end on, and nothing else")
+relayEmpty()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      defer _ = s.close()
+      val local = net(TcpListener.bind("127.0.0.1", 0))
+      val localPort = local.port()
+      val client = sc.spawn(() ->
+        val conn = net(TcpStream.connect("127.0.0.1", localPort))
+        _ = conn.shutdownOutput()
+        val all = net(conn.readAll())
+        _ = conn.close()
+        all.length)
+      val conn = net(local.accept())
+      _ = local.close()
+      val t = made(s.tunnel("127.0.0.1", echo))
+      assertEq(made(t.relay(conn)), (long(0), long(0)))
+      assertEq(client.join(), 0)
+      _ = conn.close()
+      _ = t.close()))
+
+@test("a deadline in the middle of a relay stops it, and leaves the session Interrupted")
+relayDeadline()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val s = loggedIn(dir, port, user)
+      val local = net(TcpListener.bind("127.0.0.1", 0))
+      val localPort = local.port()
+      // A client that connects and sends nothing, holding the connection open.
+      val client = sc.spawn(() ->
+        val conn = net(TcpStream.connect("127.0.0.1", localPort))
+        _ = conn.readAll()
+        _ = conn.close()
+        ())
+      val conn = net(local.accept())
+      _ = local.close()
+      val t = made(s.tunnel("127.0.0.1", echo))
+      val began = monotonic()
+      assertEq(withTimeout(millis(300), _ -> t.relay(conn).isOk), None)
+      assert(monotonic() - began < seconds(3))
+      assert(failure(s.run("true")) is Interrupted)
+      _ = conn.close()
+      client.join()
+      _ = t.close()
+      assert(s.close().isOk)))

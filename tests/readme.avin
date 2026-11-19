@@ -3,9 +3,10 @@ module tests
 // The README's examples, against the test server, logged in through the agent `SSH_AUTH_SOCK` names,
 // which `scripts/test-sshd.zsh env` points at the server's own.
 import avin.fs
-import avin.threads.{scope, withTimeout}
-import avin.time.seconds
-import dev.avinlang.ssh.{Exited, Options, Session, Signalled, SshError, Stderr, Stdout}
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{scope, sleep, withTimeout}
+import avin.time.{millis, seconds}
+import dev.avinlang.ssh.{Exited, Local, Options, Pty, Session, Signalled, SshConfig, SshError, Stderr, Stdout}
 
 uname(
   host: string,
@@ -60,6 +61,61 @@ deploy(session: Session, script: string, remote: string) -> Result[int, SshError
   val out = session.run(remote)?
   sftp.remove(remote)?
   Ok(if out.success then 0 else 1)
+
+onTerminal(config: SshConfig, alias: string, command: string) -> Result[string, SshError] =
+  val session = config.connect(alias)?
+  defer _ = session.close()
+  val running = session.exec(command, pty = Some(Pty("xterm", 120, 40)))?
+  defer _ = running.close()
+  val out = Buffer[byte]()
+  loop
+    running.next()? match
+      Some(Stdout(bytes)) -> out.addAll(bytes)
+      Some(_) -> ()
+      None -> break
+  Ok(string.fromUtf8Lossy(out.toArray()))
+
+forward(session: Session, localPort: int, host: string, port: int) -> Result[unit, SshError] =
+  val listener = TcpListener.bind("127.0.0.1", localPort).mapErr(e -> Local(e))?
+  defer _ = listener.close()
+  loop
+    val conn = listener.accept().mapErr(e -> Local(e))?
+    val tunnel = session.tunnel(host, port)?
+    _ = tunnel.relay(conn)?
+    _ = tunnel.close()
+    _ = conn.close()
+
+@test("the README's fifth example: a command on a terminal, on a host named in the configuration")
+readmeOnTerminal()
+  if server() is Some((dir, port, user))
+    val config = serverConfig(dir, port, user, s"Host web\n  HostName localhost\n  Port $port\n  ProxyJump testbox")
+    val text = made(onTerminal(config, "web", "stty size; tty"))
+    assert(text.contains("40 120"))
+    assert(text.contains("/dev/"))
+
+@test("the README's sixth example: a local port forwarded, one connection after another")
+readmeForward()
+  if server() is Some((dir, port, user))
+    scope(sc -> withEcho(sc, echo ->
+      val localPort = closedPort()
+      _ = sc.spawn(() ->
+        val s = loggedIn(dir, port, user)
+        _ = forward(s, localPort, "127.0.0.1", echo)
+        _ = s.close()
+        ())
+      for round in 0 ..< 3
+        var conn = TcpStream.connect("127.0.0.1", localPort)
+        // The forwarder may not be listening yet.
+        var tries = 0
+        while conn.isErr && tries < 100
+          sleep(millis(20))
+          conn = TcpStream.connect("127.0.0.1", localPort)
+          tries += 1
+        val c = net(conn)
+        net(c.writeText(s"round $round"))
+        net(c.shutdownOutput())
+        assertEq(string.fromUtf8Lossy(net(c.readAll())), s"round $round")
+        _ = c.close()))
 
 @test("the README's fourth example: a script uploaded, run and removed")
 readmeDeploy()

@@ -6,6 +6,7 @@ module dev.avinlang.ssh
 // lightweight thread parks and its worker runs other threads meanwhile; the wait is a cancellation
 // point, so a `withTimeout` or `withDeadline` around the work, or the cancellation of its scope, ends it.
 import avin.c.Errno
+import avin.net.ByteStream
 import avin.threads.{Readiness, Writability}
 import avin.time.Duration
 
@@ -51,6 +52,55 @@ private class Socket(val fd: int): Readiness, Writability
   private polled(events: int) -> bool
     val (n, _) = pollRaw(PollFd(fd, events, 0), 1, 0)
     n != 0
+
+  // Waits until `local` can be read where `read` says, or written where `write` says, or the socket
+  // is ready to read (`host` 1) or to write (`host` 2); `host` 0 leaves the socket out. Answers at
+  // once where it is asked to wait for nothing.
+  waitWith(local: ByteStream, read: bool, write: bool, host: int)
+    if host == 0
+      if read && write
+        select
+          local.readable() -> ()
+          local.writable() -> ()
+      elif read
+        select
+          local.readable() -> ()
+      elif write
+        select
+          local.writable() -> ()
+    elif host == 1
+      if read && write
+        select
+          self.readable() -> ()
+          local.readable() -> ()
+          local.writable() -> ()
+      elif read
+        select
+          self.readable() -> ()
+          local.readable() -> ()
+      elif write
+        select
+          self.readable() -> ()
+          local.writable() -> ()
+      else
+        select
+          self.readable() -> ()
+    elif read && write
+      select
+        self.writable() -> ()
+        local.readable() -> ()
+        local.writable() -> ()
+    elif read
+      select
+        self.writable() -> ()
+        local.readable() -> ()
+    elif write
+      select
+        self.writable() -> ()
+        local.writable() -> ()
+    else
+      select
+        self.writable() -> ()
 
   // Waits until the socket is ready the way libssh2 last asked, `directions` holding its
   // `LIBSSH2_SESSION_BLOCK_*` bits (reading where it holds neither), at most `limit` where it is

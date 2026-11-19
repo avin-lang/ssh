@@ -149,3 +149,74 @@ as a fan-out would: two hundred connections at once to one `sshd` overflow its l
 A class's private members are private to it, and a command needs the session's waits and state; the
 two public classes share a private class holding them, so nothing of it is visible outside the
 module.
+
+## A terminal is an option of `exec`, and a shell is an `Exec`
+
+(Proposed 2026-11-19, branch `pty-forward`.) `exec(command, stderr, pty)` and `shell(pty, stderr)`
+both answer an `Exec`, read and written as any command is; `Pty(term, columns, rows, modes)` holds the
+request, its modes as `(opcode, value)` pairs with the common opcodes named on `TerminalMode`, and
+`resize` is a method of `Exec` that answers `Invalid` on a command without a terminal. Under a
+terminal the server sends no standard error of its own, so the `Exec` reads standard output alone,
+whatever `stderr` asked. `shell()` asks for an `xterm` of 80 by 24 unless told otherwise, as an
+interactive shell is what one usually wants; `shell(pty = None)` is the non-interactive one. The
+`shell` request is bound with a null message, since OpenSSH ends a session whose `shell` request
+carries one. *Alternatives*: a separate `Terminal` class (a second reader of output to keep in step
+with `Exec`); modes as a `data` of every RFC 4254 opcode (seventy names for a rarely used field).
+
+## A tunnel is a byte stream; `relay` joins one to a local connection, on the session's thread
+
+(Proposed 2026-11-19, branch `pty-forward`.) `Session.tunnel(host, port)` opens a `direct-tcpip`
+channel and answers a `Tunnel`, an `io.Reader` and `io.ByteWriter` with `closeWrite` as its
+half-close; a tunnel is closed without the `TERM` a command is sent. `Tunnel.relay(local)` copies both
+ways between it and any `ByteStream` this thread owns, holding at most one piece in each direction
+so a side that does not read holds the other back through the SSH window, and passing each end on as
+a half-close. It waits on the session's socket and the local stream in one `select`. Because a
+`select`'s arms are fixed when it is written, the wait is spelled out for each combination of the
+three it may need (local readable, local writable, the session's socket readable or writable), which
+is twelve small `select`s in `Socket.waitWith`.
+
+**No `ssh -L` convenience that serves several local connections at once.** A session belongs to one
+thread, so every tunnel's bytes are read and written there; serving N connections at once would
+mean one thread waiting on N local streams and the session together, which a `select` with arms
+fixed in the source cannot express, and handing the bytes to per-connection threads instead is ruled
+out because `Array[byte]` is not `Sendable` (only the standard library may mark a class
+`@trusted_sendable`), so each piece would be copied into a `Vector[byte]`. The README shows the
+one-at-a-time loop. **Review with the user**: a `select` over a collection of streams, or a
+sendable byte buffer, would let the package add it.
+
+Listening on the server's side (`ssh -R`, `tcpip-forward`) is not bound: an accepted forward needs
+the same multi-connection wait.
+
+## `~/.ssh/config` is read by a pure parser, and `connect(alias)` logs in
+
+(Proposed 2026-11-19, branch `pty-forward`.) `SshConfig` parses the file into lines (Includes expanded
+when it is read, nested as blocks so a `Host` inside an included file ends at that file's end, as in
+`ssh`), and `host(alias)` replays them for the alias. Choices:
+
+- **Only the keywords the package uses are interpreted**; every other keyword is passed over without
+  a check, since real files hold dozens the package has no use for. A used keyword with a value it
+  cannot take (`Port abc`) is `Config(path, line, reason)`.
+- **`Match` takes `host`, `user` and `all`; any other criterion is refused** when the file is read,
+  naming the criterion and its line. `Match host` fits the `HostName` set so far, else the alias, as
+  in `ssh`.
+- **A relative `Include` is read from the directory of the file read first** (`~/.ssh` for the
+  user's file, as `ssh` does); a path matching nothing is passed over; nesting stops at 16.
+- **`StrictHostKeyChecking no` and `off` are taken as `accept-new`**: the package never accepts a
+  changed key (see the host-key entry above), and `ask` is `yes`, there being no one to ask.
+- **`IdentitiesOnly`** is read too, so a configuration can keep the agent out of a login.
+- **`connect(alias)` logs in** with the agent (unless `IdentitiesOnly yes`), then each identity file
+  that exists, else the default `~/.ssh/id_*` keys; a key under a passphrase is passed over. A
+  caller wanting another order connects with `Session.connect(h.hostName, h.port, h.options())` and
+  logs in itself.
+- **`ProxyJump` is implemented** over `direct-tcpip`: libssh2 needs a socket for a session, so a
+  thread of its own makes the jump host's session (resolved through the same configuration, its own
+  `ProxyJump` followed, at most 8 deep), opens a tunnel to the target, and relays it to the first
+  connection to a listener on a loopback port, which the target's session then connects to; its host
+  key is checked under the target's own name and port. The thread ends when the target's session
+  closes. **Review with the user**: another process of the machine could connect to that loopback
+  port first, in the instant before the session does; it would gain nothing, since the target's key
+  is checked, but the session would then fail to connect.
+
+*Alternatives*: refusing `ProxyJump` (fettle's jump hosts need it); libssh2's send and receive
+callbacks pointed at the jump channel (C callbacks into Avin code from inside libssh2, with no way to
+park the thread).

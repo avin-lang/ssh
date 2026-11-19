@@ -18,6 +18,8 @@
 #   client          the key the server authorizes, with no passphrase (and client.pub)
 #   locked          a key the server authorizes, under the passphrase `sesame` (and locked.pub)
 #   stranger        a key the server does not authorize (and stranger.pub)
+#   restricted      a key the server authorizes with `no-pty,no-port-forwarding`, so it refuses
+#                   every terminal and every tunnel asked for under it (and restricted.pub)
 #   known_hosts     the server's host key under [127.0.0.1]:PORT and [localhost]:PORT
 #   other_hosts     another key under the same names, as a host whose key changed
 #   agent.sock      the private ssh-agent, holding `client`
@@ -91,6 +93,10 @@ ClientAliveInterval 0
 Subsystem sftp /usr/libexec/sftp-server
 LogLevel INFO
 EOF
+    fi
+    if [[ ! -f $root/restricted ]]; then
+      ssh-keygen -q -t ed25519 -N '' -C 'avin ssh test restricted' -f $root/restricted
+      print -r -- "no-pty,no-port-forwarding $(<$root/restricted.pub)" >> $root/authorized_keys
     fi
     if ! running; then
       /usr/sbin/sshd -f $root/sshd_config -E $root/sshd.log

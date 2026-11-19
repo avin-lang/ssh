@@ -1,0 +1,520 @@
+module dev.avinlang.ssh
+
+// The user's SSH configuration, `~/.ssh/config`, read the way `ssh` reads it, and sessions made by
+// the names it gives hosts.
+import avin.fs
+import avin.net.TcpListener
+import avin.process
+import avin.threads.{Channel, spawn, withTimeout}
+import avin.time.{Duration, seconds}
+
+// How deep `Include` may nest, as in `ssh`.
+private val MaxIncludeDepth = 16
+
+// How many jump hosts a connection may go through.
+private val MaxJumps = 8
+
+// What a configuration file says, line by line.
+private data Entry
+  // A keyword, lower case, with its arguments, from line `line` of `file`.
+  Setting(keyword: string, args: Vector[string], file: string, line: int)
+  // `Host` and its patterns, lower case.
+  HostBlock(patterns: Vector[string])
+  // `Match` and its criteria.
+  MatchBlock(criteria: Vector[Criterion])
+  // What the files an `Include` names say, in order.
+  Included(entries: Vector[Entry])
+
+// One criterion of a `Match` line.
+private data Criterion
+  AllHosts
+  HostIn(patterns: Vector[string])
+  UserIn(patterns: Vector[string])
+
+// What the configuration says about one host: where to connect, as whom, with which keys, through
+// which jump host, and how to trust and keep the connection. `alias` is the name it was asked for.
+data HostConfig(
+  alias: string,
+  // The host to connect to: `HostName`, `%h` in it read as the alias, or the alias itself.
+  hostName: string,
+  // `User`, or the user running the program.
+  user: string,
+  // `Port`, or 22.
+  port: int,
+  // The `IdentityFile`s in the order given, `~` and the `%` tokens expanded; empty where none is.
+  identityFiles: Vector[string],
+  // `ProxyJump`: the jump hosts, `[user@]host[:port]` separated by commas; `None` where it is not set
+  // or is `none`.
+  proxyJump: Option[string],
+  // `StrictHostKeyChecking`: `yes` and `ask` are `Strict`, `accept-new`, `no` and `off` are
+  // `AcceptNew`, since no session accepts a changed key; `None` where it is not set.
+  hostKeys: Option[HostKeys],
+  // The first `UserKnownHostsFile`, `~` and the `%` tokens expanded.
+  knownHosts: Option[string],
+  // `ConnectTimeout`, where it is set and not 0.
+  connectTimeout: Option[Duration],
+  // `ServerAliveInterval`, where it is set and not 0.
+  keepalive: Option[Duration],
+  // `IdentitiesOnly yes`: log in with the identity files alone, never the agent.
+  identitiesOnly: bool = false
+)
+
+impl HostConfig
+  // `base` with what the configuration sets in its place: the host-key policy, the known-hosts file,
+  // the connect timeout and the keepalive. The rest of `base` is kept.
+  options(base: Options = Options()) -> Options =
+    base with {
+      connectTimeout = if connectTimeout.isDefined then connectTimeout else base.connectTimeout,
+      hostKeys = hostKeys.getOrElse(base.hostKeys),
+      knownHosts = if knownHosts.isDefined then knownHosts else base.knownHosts,
+      keepalive = if keepalive.isDefined then keepalive else base.keepalive
+    }
+
+// An SSH configuration, read from `~/.ssh/config` by `load`, from a file by `read`, or from text by
+// `parse`. `host(alias)` answers what it says about a host and `connect(alias)` makes a session with
+// it, logged in.
+//
+// It is read as `ssh` reads it. Keywords are case-insensitive, and a keyword is separated from its
+// arguments by spaces or by `=`; an argument may be double-quoted; a line whose first word starts with
+// `#` is a comment, and so is the rest of a line from a word starting with `#`. `Host` starts a block
+// that applies where one of its patterns fits the alias and none of its `!` patterns does, `*` being
+// any run of characters and `?` one. `Match` starts one that applies where all its criteria hold:
+// `host` (patterns, comma-separated, fitting the host name as set so far, else the alias), `user`
+// (fitting the user as set so far, else the local one) and `all`; any other criterion is refused.
+// `Include` reads the files its arguments name, globs among them, a relative one from the directory
+// of the file read first, and its lines count only where the line including them does. For every
+// keyword but `IdentityFile` the first value that applies wins; every `IdentityFile` that applies is
+// kept. Keywords the package does not use are passed over.
+class SshConfig(private val entries: Vector[Entry], val path: string)
+  // What the configuration says about the host named `alias`.
+  host(alias: string) -> Result[HostConfig, SshError]
+    if alias.isEmpty then return Err(Invalid("no host was named"))
+    val r = Resolving(alias, localUser())
+    applyEntries(entries, true, r)
+    r.finished(path)
+
+  // A session with the host named `alias`, as the configuration describes it: connected (through its
+  // jump hosts, each found in the configuration too), its host key checked, and logged in. The login
+  // tries the SSH agent first where `SSH_AUTH_SOCK` is set and `IdentitiesOnly` is not `yes`, then
+  // each `IdentityFile`, or where there
+  // is none, `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa` and `~/.ssh/id_rsa` that exist; a key under a
+  // passphrase is passed over. The failure answered is the last one met. `options` give what the
+  // configuration does not set (see `HostConfig.options`).
+  //
+  // A session through a jump host reaches it over a connection to a port of this machine's loopback
+  // address, which a thread of its own joins to a tunnel from the jump host: the thread owns the
+  // jump host's session, and ends when the session made through it is closed. The target's host key is
+  // checked under its own name and port, so nothing standing at that loopback port can pose as it.
+  connect(alias: string, options: Options = Options()) -> Result[Session, SshError] =
+    connectHost(host(alias)?, options, 0)
+
+  // A session with `h`, logged in, through `depth` jump hosts already.
+  private connectHost(h: HostConfig, options: Options, depth: int) -> Result[Session, SshError]
+    val opts = h.options(options)
+    val session = h.proxyJump match
+      Some(jump) -> jumped(jump, h, options, depth)?
+      None -> Session.connect(h.hostName, h.port, opts)?
+    login(session, h) match
+      Ok(_) -> Ok(session)
+      Err(e) ->
+        _ = session.close()
+        Err(e)
+
+  // A session with `h` through the last of the jump hosts `spec` names, the others before it.
+  private jumped(spec: string, h: HostConfig, options: Options, depth: int) -> Result[Session, SshError]
+    if depth >= MaxJumps then return Err(Config(path, 0, s"ProxyJump goes through more than $MaxJumps hosts"))
+    val hops = spec.split(',').map(s -> s.trim).filter(s -> s.nonEmpty)
+    if hops.isEmpty then return Err(Config(path, 0, "ProxyJump names no host"))
+    val (jumpUser, jumpHost, jumpPort) = jumpTarget(hops.last, path)?
+    val named = host(jumpHost)?
+    val jump = named with {
+      user = jumpUser.getOrElse(named.user),
+      port = jumpPort.getOrElse(named.port),
+      proxyJump = if hops.length > 1 then Some(hops.init.mkString(",")) else named.proxyJump
+    }
+    val listener = TcpListener.bind("127.0.0.1", 0).mapErr(e -> Local(e))?
+    val localPort = listener.port()
+    val ready = Channel[Result[unit, SshError]](1)
+    val config = self
+    val target = h.hostName
+    val targetPort = h.port
+    _ = spawn(() -> config.carry(jump, options, depth + 1, target, targetPort, listener, ready))
+    ready.receive() match
+      Some(Ok(_)) -> connectThrough("127.0.0.1", localPort, h.hostName, h.port, h.options(options))
+      Some(Err(e)) -> Err(e)
+      None -> Err(Failed(0, "the jump host's thread ended"))
+
+  // On a thread of its own: a session with the jump host `jump`, a tunnel from it to `host` at
+  // `port`, said on `ready`, then the first connection `listener` takes joined to the tunnel until
+  // both have finished.
+  private carry(
+      jump: HostConfig,
+      options: Options,
+      depth: int,
+      host: string,
+      port: int,
+      listener: TcpListener,
+      ready: Channel[Result[unit, SshError]]
+  )
+    val js = connectHost(jump, options, depth) match
+      Ok(s) -> s
+      Err(e) ->
+        _ = listener.close()
+        ready.send(Err(e))
+        return
+    defer _ = js.close()
+    val t = js.tunnel(host, port) match
+      Ok(t) -> t
+      Err(e) ->
+        _ = listener.close()
+        ready.send(Err(e))
+        return
+    defer _ = t.close()
+    ready.send(Ok(()))
+    // The session through the tunnel connects at once; a caller cancelled before it did never will.
+    val accepted = withTimeout(30.seconds, _ -> listener.accept())
+    _ = listener.close()
+    accepted match
+      Some(Ok(conn)) ->
+        _ = t.relay(conn)
+        _ = conn.close()
+      _ -> ()
+
+object SshConfig
+  // The user's configuration, `~/.ssh/config`; an empty one where there is no such file.
+  load() -> Result[SshConfig, SshError]
+    val home = process.homeDir().getOrElse(".")
+    val file = s"$home/.ssh/config"
+    if !fs.exists(file) then return Ok(SshConfig([], file))
+    read(file)
+
+  // The configuration in the file `file`. `Config` where it cannot be read, or a line of it, or of a
+  // file it includes, cannot be used.
+  read(file: string) -> Result[SshConfig, SshError]
+    val text = fs.readText(file).mapErr(e -> Config(file, 0, e.message))?
+    parse(text, file, fs.parent(file).getOrElse("."))
+
+  // The configuration `text` holds, read as the file `file`, a relative `Include` read from `dir`.
+  parse(text: string, file: string = "ssh_config", dir: string = ".") -> Result[SshConfig, SshError] =
+    Ok(SshConfig(parsed(text, file, dir, 0)?, file))
+
+// The entries of `text`, the file `file`, `depth` includes deep.
+private parsed(text: string, file: string, dir: string, depth: int) -> Result[Vector[Entry], SshError]
+  val out = Buffer[Entry]()
+  var n = 0
+  for line in text.lines
+    n += 1
+    val words = tokens(line, file, n)?
+    if words.nonEmpty
+      val keyword = words(0).toLower
+      val args = words.drop(1)
+      if keyword == "host"
+        if args.isEmpty then return Err(Config(file, n, "Host needs a pattern"))
+        out.addOne(HostBlock(args.map(a -> a.toLower)))
+      elif keyword == "match"
+        out.addOne(MatchBlock(criteria(args, file, n)?))
+      elif keyword == "include"
+        if args.isEmpty then return Err(Config(file, n, "Include needs a file"))
+        if depth >= MaxIncludeDepth then return Err(Config(file, n, s"Include nests more than $MaxIncludeDepth deep"))
+        for a in args
+          val pattern = homeExpanded(a)
+          for f in fs.glob(if fs.isAbsolute(pattern) then pattern else fs.join(dir, pattern))
+            val inner = fs.readText(f).mapErr(e -> Config(f, 0, e.message))?
+            out.addOne(Included(parsed(inner, f, dir, depth + 1)?))
+      else
+        checked(keyword, args, file, n)?
+        out.addOne(Setting(keyword, args, file, n))
+  Ok(out.toVector)
+
+// The words of a line: the keyword, then its arguments, a `=` after the keyword dropped, quotes taken
+// off, and nothing from a word starting with `#`.
+private tokens(line: string, file: string, n: int) -> Result[Vector[string], SshError]
+  val cs = line.chars
+  val out = Buffer[string]()
+  var i = 0
+  loop
+    while i < cs.length && isBlank(cs(i))
+      i += 1
+    if i >= cs.length then break
+    // The `=` between the keyword and its first argument.
+    if out.length == 1 && cs(i) == '='
+      i += 1
+      continue
+    if cs(i) == '#' then break
+    val word = Buffer[char]()
+    if cs(i) == '"'
+      i += 1
+      while i < cs.length && cs(i) != '"'
+        word.addOne(cs(i))
+        i += 1
+      if i >= cs.length then return Err(Config(file, n, "a quoted argument has no closing quote"))
+      i += 1
+    else
+      // The keyword ends at a `=` as well as at a blank.
+      while i < cs.length && !isBlank(cs(i)) && !(out.isEmpty && cs(i) == '=')
+        word.addOne(cs(i))
+        i += 1
+    out.addOne(word.mkString(""))
+  Ok(out.toVector)
+
+private isBlank(c: char) -> bool = c == ' ' || c == '\t' || c == '\r'
+
+// `Ok` where the keyword's arguments are ones the package can use.
+private checked(keyword: string, args: Vector[string], file: string, n: int) -> Result[unit, SshError]
+  val used = [
+    "hostname", "user", "port", "identityfile", "proxyjump", "stricthostkeychecking", "userknownhostsfile",
+    "connecttimeout", "serveraliveinterval", "identitiesonly"
+  ]
+  if !used.contains(keyword) then return Ok(())
+  if args.isEmpty then return Err(Config(file, n, s"${args.length} arguments to $keyword: it needs one"))
+  if keyword == "port"
+    args(0).toIntOption() match
+      Some(p) if 1 <= p <= 65535 -> ()
+      _ -> return Err(Config(file, n, s"Port ${args(0)} is not a TCP port"))
+  if keyword == "connecttimeout" || keyword == "serveraliveinterval"
+    args(0).toIntOption() match
+      Some(s) if s >= 0 -> ()
+      _ -> return Err(Config(file, n, s"$keyword ${args(0)} is not a number of seconds"))
+  if keyword == "stricthostkeychecking"
+    val v = args(0).toLower
+    if !["yes", "no", "ask", "accept-new", "off"].contains(v)
+      return Err(Config(file, n, s"StrictHostKeyChecking ${args(0)} is not yes, no, ask, accept-new or off"))
+  if keyword == "identitiesonly" && !["yes", "no"].contains(args(0).toLower)
+    return Err(Config(file, n, s"IdentitiesOnly ${args(0)} is not yes or no"))
+  Ok(())
+
+// The criteria of a `Match` line.
+private criteria(args: Vector[string], file: string, n: int) -> Result[Vector[Criterion], SshError]
+  if args.isEmpty then return Err(Config(file, n, "Match needs a criterion"))
+  val out = Buffer[Criterion]()
+  var i = 0
+  while i < args.length
+    val word = args(i).toLower
+    if word == "all"
+      if args.length != 1 then return Err(Config(file, n, "Match all takes no other criterion"))
+      out.addOne(AllHosts)
+      i += 1
+    elif word == "host" || word == "user"
+      if i + 1 >= args.length then return Err(Config(file, n, s"Match $word needs patterns"))
+      val patterns = args(i + 1).split(',').filter(p -> p.nonEmpty)
+      out.addOne(if word == "host" then HostIn(patterns.map(p -> p.toLower)) else UserIn(patterns))
+      i += 2
+    else
+      return Err(Config(file, n, s"Match ${args(i)} is not supported: only host, user and all are"))
+  Ok(out.toVector)
+
+// What is set as the entries are applied for one alias.
+private class Resolving(val alias: string, val localUser: string)
+  var hostName: Option[string] = None
+  var user: Option[string] = None
+  var port: Option[int] = None
+  val identityFiles = Buffer[string]()
+  var proxyJump: Option[string] = None
+  var strict: Option[string] = None
+  var knownHosts: Option[string] = None
+  var connectTimeout: Option[int] = None
+  var aliveInterval: Option[int] = None
+  var identitiesOnly: Option[bool] = None
+
+  // The host name as set so far, else the alias, lower case: what `Match host` fits.
+  currentHost -> string = hostName.map(h -> percentHost(h, alias)).getOrElse(alias).toLower
+
+  // Takes the keyword's value where none has been taken.
+  set(keyword: string, args: Vector[string])
+    // A keyword the package does not use may have no arguments; one it uses was checked to have one.
+    if args.isEmpty then return
+    val v = args(0)
+    if keyword == "hostname" && hostName.isEmpty then hostName = Some(v)
+    elif keyword == "user" && user.isEmpty then user = Some(v)
+    elif keyword == "port" && port.isEmpty then port = Some(v.toInt())
+    elif keyword == "identityfile"
+      if !identityFiles.contains(v) then identityFiles.addOne(v)
+    elif keyword == "proxyjump" && proxyJump.isEmpty then proxyJump = Some(v)
+    elif keyword == "stricthostkeychecking" && strict.isEmpty then strict = Some(v.toLower)
+    elif keyword == "userknownhostsfile" && knownHosts.isEmpty then knownHosts = Some(v)
+    elif keyword == "connecttimeout" && connectTimeout.isEmpty then connectTimeout = Some(v.toInt())
+    elif keyword == "serveraliveinterval" && aliveInterval.isEmpty then aliveInterval = Some(v.toInt())
+    elif keyword == "identitiesonly" && identitiesOnly.isEmpty then identitiesOnly = Some(v.toLower == "yes")
+
+  // What was set, the defaults filled in and the paths expanded.
+  finished(file: string) -> Result[HostConfig, SshError]
+    val name = hostName.map(h -> percentHost(h, alias)).getOrElse(alias)
+    val who = user.getOrElse(localUser)
+    val at = port.getOrElse(22)
+    val expand = (p: string) -> percentPath(homeExpanded(p), name, alias, who, localUser, at, file)
+    val files = Buffer[string]()
+    for f in identityFiles
+      files.addOne(expand(f)?)
+    val known = knownHosts match
+      Some(k) -> Some(expand(k)?)
+      None -> None
+    val keys = strict.map(s -> if s == "yes" || s == "ask" then Strict else AcceptNew)
+    Ok(
+      HostConfig(
+        alias,
+        name,
+        who,
+        at,
+        files.toVector,
+        proxyJump.filter(j -> j.toLower != "none"),
+        keys,
+        known,
+        connectTimeout.filter(s -> s > 0).map(s -> s.seconds),
+        aliveInterval.filter(s -> s > 0).map(s -> s.seconds),
+        identitiesOnly.getOrElse(false)
+      )
+    )
+
+// Applies `entries` to `r`, those that apply only where `active` says.
+private applyEntries(entries: Vector[Entry], active: bool, r: Resolving)
+  var on = active
+  for e in entries
+    e match
+      HostBlock(patterns) -> on = active && fits(patterns, r.alias.toLower)
+      MatchBlock(cs) -> on = active && cs.forall(c -> holds(c, r))
+      Included(inner) -> applyEntries(inner, on, r)
+      Setting(keyword, args, _, _) -> if on then r.set(keyword, args)
+
+// Whether the criterion holds for what `r` has so far.
+private holds(c: Criterion, r: Resolving) -> bool = c match
+  AllHosts -> true
+  HostIn(patterns) -> fits(patterns, r.currentHost)
+  UserIn(patterns) -> fits(patterns, r.user.getOrElse(r.localUser))
+
+// Whether `value` fits one of `patterns` and none of those starting with `!`.
+private fits(patterns: Vector[string], value: string) -> bool
+  var any = false
+  for p in patterns
+    if p.startsWith("!")
+      if wildcard(p.drop(1).chars, value.chars) then return false
+    elif wildcard(p.chars, value.chars)
+      any = true
+  any
+
+// Whether `text` fits `pattern`, `*` in it any run of characters and `?` one.
+private wildcard(pattern: Vector[char], text: Vector[char]) -> bool
+  var p = 0
+  var t = 0
+  var star = -1
+  var mark = 0
+  while t < text.length
+    if p < pattern.length && (pattern(p) == '?' || pattern(p) == text(t))
+      p += 1
+      t += 1
+    elif p < pattern.length && pattern(p) == '*'
+      star = p
+      mark = t
+      p += 1
+    elif star >= 0
+      p = star + 1
+      mark += 1
+      t = mark
+    else
+      return false
+  while p < pattern.length && pattern(p) == '*'
+    p += 1
+  p == pattern.length
+
+// `p` with a leading `~` read as the home directory.
+private homeExpanded(p: string) -> string
+  if p != "~" && !p.startsWith("~/") then return p
+  process.homeDir() match
+    Some(home) -> home + p.drop(1)
+    None -> p
+
+// A `HostName` with `%h` read as the alias and `%%` as `%`.
+private percentHost(
+    h: string,
+    alias: string
+) -> string = h.replace("%%", "\u0000").replace("%h", alias).replace("\u0000", "%")
+
+// A path with its `%` tokens read: `%d` the home directory, `%h` the host name, `%n` the alias, `%r`
+// the remote user, `%u` the local one, `%p` the port, `%%` a `%`. Any other is `Config`.
+private percentPath(
+    p: string,
+    host: string,
+    alias: string,
+    remote: string,
+    local: string,
+    port: int,
+    file: string
+) -> Result[string, SshError]
+  if !p.contains("%") then return Ok(p)
+  val cs = p.chars
+  val out = Buffer[string]()
+  var i = 0
+  while i < cs.length
+    if cs(i) != '%'
+      out.addOne(s"${cs(i)}")
+      i += 1
+    elif i + 1 >= cs.length
+      return Err(Config(file, 0, s"$p ends in a lone %"))
+    else
+      val token = cs(i + 1)
+      val value = token match
+        'd' -> process.homeDir().getOrElse("")
+        'h' -> host
+        'n' -> alias
+        'r' -> remote
+        'u' -> local
+        'p' -> s"$port"
+        '%' -> "%"
+        _ -> return Err(Config(file, 0, s"$p holds %$token, which is not supported"))
+      out.addOne(value)
+      i += 2
+  Ok(out.mkString(""))
+
+// The user running the program.
+private localUser() -> string = process.env("USER").getOrElse("")
+
+// The user, host and port of a jump host written `[user@]host[:port]`, `[address]:port` for an IPv6
+// address, or `ssh://[user@]host[:port]`.
+private jumpTarget(spec: string, file: string) -> Result[(Option[string], string, Option[int]), SshError]
+  val bare = spec.stripPrefix("ssh://")
+  val at = bare.lastIndexOf('@')
+  val user = if at > 0 then Some(bare.slice(0, at)) else None
+  val rest = if at >= 0 then bare.slice(at + 1, bare.byteLength) else bare
+  var host = rest
+  var portText: Option[string] = None
+  if rest.startsWith("[")
+    val close = rest.indexOf(']')
+    if close < 0 then return Err(Config(file, 0, s"ProxyJump $spec has no closing ]"))
+    host = rest.slice(1, close)
+    val after = rest.slice(close + 1, rest.byteLength)
+    if after.startsWith(":")
+      portText = Some(after.drop(1))
+    elif after.nonEmpty
+      return Err(Config(file, 0, s"ProxyJump $spec is not [user@]host[:port]"))
+  else
+    val colon = rest.lastIndexOf(':')
+    if colon >= 0
+      host = rest.slice(0, colon)
+      portText = Some(rest.slice(colon + 1, rest.byteLength))
+  if host.isEmpty then return Err(Config(file, 0, s"ProxyJump $spec names no host"))
+  val port = portText match
+    Some(t) -> t.toIntOption() match
+      Some(p) if 1 <= p <= 65535 -> Some(p)
+      _ -> return Err(Config(file, 0, s"ProxyJump $spec has no TCP port $t"))
+    None -> None
+  Ok((user, host, port))
+
+// The SSH configuration's login for a session made by it: the agent, then the identity files.
+private login(session: Session, h: HostConfig) -> Result[unit, SshError]
+  var last: Option[SshError] = None
+  if !h.identitiesOnly && process.env("SSH_AUTH_SOCK").isDefined
+    session.authAgent(h.user) match
+      Ok(_) -> return Ok(())
+      Err(e) -> last = Some(e)
+  val files = if h.identityFiles.nonEmpty then h.identityFiles else defaultIdentities()
+  for f in files
+    if !session.isOpen then break
+    if fs.exists(f)
+      session.authKey(h.user, f) match
+        Ok(_) -> return Ok(())
+        Err(e) -> last = Some(e)
+  Err(last.getOrElse(AuthFailed("publickey", [])))
+
+// The private keys `ssh` tries where the configuration names none.
+private defaultIdentities() -> Vector[string] = process.homeDir() match
+  Some(home) -> [s"$home/.ssh/id_ed25519", s"$home/.ssh/id_ecdsa", s"$home/.ssh/id_rsa"]
+  None -> []

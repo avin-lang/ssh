@@ -1,0 +1,180 @@
+module dev.avinlang.ssh
+
+// A tunnel: a TCP connection the server makes on the session's behalf (`direct-tcpip`), its bytes
+// carried by a channel of the session, and the relay that joins it to a local connection.
+import avin.io
+import avin.io.IoError
+import avin.net.ByteStream
+
+// How much one read of a tunnel takes at most.
+private val TunnelChunk = 32768
+
+// A connection the server made to a host and port as it sees them, by `Session.tunnel`, as `ssh -L`
+// and `ssh -J` make theirs: what is written to the tunnel reaches that host, and what the host sends
+// is read from it. It is an `io.Reader` and an `io.ByteWriter`, so it streams through anything that
+// takes one.
+//
+// A tunnel belongs to its session's thread, as a command does. `closeWrite` tells the host nothing
+// more is coming, as a TCP half-close does, and reading goes on; `close` ends it. Closing the session
+// closes it, after which every operation answers `Closed`. Several run on one session at once, beside
+// its commands.
+class Tunnel(
+    private val link: Link,
+    private val raw: RawChannel,
+    val host: string,
+    val port: int
+): io.Reader, io.ByteWriter, io.Close
+  private var closed = false
+  private var ended = false
+  private var writeClosed = false
+  private val buffer = Array.fill(TunnelChunk, byte(0))
+
+  // Whether the tunnel can still be used: neither it nor its session closed.
+  isOpen -> bool = !closed && link.isOpen
+
+  // Up to `max` bytes the host sent, waiting for at least one, or an empty array once the host has
+  // finished sending.
+  receive(max: int = TunnelChunk) -> Result[Array[byte], SshError]
+    usable()?
+    if max < 1 then return Err(Invalid(s"a read of $max bytes"))
+    if ended then return Ok(Array.empty[byte]())
+    val into = if max >= TunnelChunk then buffer else Array.fill(max, byte(0))
+    loop
+      val n = raw.readInto(0, into)
+      if n > 0 then return Ok(into.slice(0, int(n)))
+      if n == 0
+        ended = true
+        return Ok(Array.empty[byte]())
+      if n != long(eagain) then return Err(link.failure(int(n), "read from the tunnel"))
+      // Bytes read off the socket for this channel by another's read wait in libssh2's queue.
+      if raw.queued(0) == 0 && raw.atEof() == 0
+        link.await("read from the tunnel")?
+
+  // Up to `max` bytes, as `receive`, for an `io.Reader`.
+  override read(max: int) -> Result[Array[byte], IoError] =
+    receive(max).mapErr(e -> asIoError(e, "read from"))
+
+  // Sends all of `bytes` to the host.
+  send(bytes: Array[byte]) -> Result[unit, SshError]
+    usable()?
+    if writeClosed then return Err(Invalid("the tunnel's writing side is closed"))
+    var at = 0
+    while at < bytes.length
+      val piece = if at == 0 then bytes else bytes.slice(at, bytes.length)
+      val n = link.retryingCount("write to the tunnel", () -> raw.writeFrom(0, piece))?
+      if n < 0 then return Err(link.failure(int(n), "write to the tunnel"))
+      at += int(n)
+    Ok(())
+
+  // Sends all of `bytes`, as `send`, for an `io.ByteWriter`.
+  override write(bytes: Array[byte]) -> Result[unit, IoError] =
+    send(bytes).mapErr(e -> asIoError(e, "write to"))
+
+  // Tells the host nothing more will be sent; the server shuts down its connection's writing side,
+  // and reading goes on. Closing it again does nothing.
+  closeWrite() -> Result[unit, SshError]
+    usable()?
+    if writeClosed then return Ok(())
+    val rc = link.retrying("end the tunnel's input", () -> raw.sendEof())?
+    if rc < 0 then return Err(link.failure(rc, "end the tunnel's input"))
+    writeClosed = true
+    Ok(())
+
+  // Joins the tunnel to `local`, a connection this thread owns: what `local` sends is written to the
+  // tunnel and what the host sends is written to `local`, both ways at once, each as it comes, until
+  // both sides have finished sending. A side that finishes has its end passed on, `closeWrite` to the
+  // tunnel or `shutdownOutput` to `local`, so the other goes on until it finishes too. Neither is
+  // closed. Answers how many bytes went each way, to the host first.
+  //
+  // At most one piece read from either side waits to be written to the other, so a side that does not
+  // read holds the other back rather than filling memory. The relay waits on the session's socket and
+  // `local` together, parking only its thread; it is a cancellation point, and a cancellation leaves
+  // the session `Interrupted`. A failure of `local` is `Local`.
+  relay(local: ByteStream) -> Result[(long, long), SshError]
+    usable()?
+    var up: long = 0
+    var down: long = 0
+    // A piece read from `local`, and how much of it the tunnel has taken.
+    var toHost = Array.empty[byte]()
+    var hostAt = 0
+    // A piece read from the tunnel, and how much of it `local` has taken.
+    var toLocal = Array.empty[byte]()
+    var localAt = 0
+    var localEnded = false
+    var localShut = false
+    loop
+      var progress = false
+      // From the host to `local`.
+      if localAt == toLocal.length && !ended
+        val n = raw.readInto(0, buffer)
+        if n > 0
+          toLocal = buffer.slice(0, int(n))
+          localAt = 0
+          progress = true
+        elif n == 0
+          ended = true
+          progress = true
+        elif n != long(eagain)
+          return Err(link.failure(int(n), "read from the tunnel"))
+      if localAt < toLocal.length && local.writable()
+        val sent = local.writeSome(toLocal.slice(localAt, toLocal.length)).mapErr(e -> Local(e))?
+        localAt += sent
+        down += long(sent)
+        progress = true
+      if ended && localAt == toLocal.length && !localShut
+        local.shutdownOutput().mapErr(e -> Local(e))?
+        localShut = true
+        progress = true
+      // From `local` to the host.
+      if hostAt == toHost.length && !localEnded && local.readable()
+        val bytes = local.read(TunnelChunk).mapErr(e -> Local(e))?
+        if bytes.isEmpty
+          localEnded = true
+        else
+          toHost = bytes
+          hostAt = 0
+        progress = true
+      var hostBlocked = false
+      if hostAt < toHost.length
+        val n = raw.writeFrom(0, if hostAt == 0 then toHost else toHost.slice(hostAt, toHost.length))
+        if n > 0
+          hostAt += int(n)
+          up += n
+          progress = true
+        elif n == long(eagain)
+          hostBlocked = true
+        elif n < 0
+          return Err(link.failure(int(n), "write to the tunnel"))
+      if localEnded && hostAt == toHost.length && !writeClosed
+        val rc = raw.sendEof()
+        if rc == 0
+          writeClosed = true
+          progress = true
+        elif rc == eagain
+          hostBlocked = true
+        else
+          return Err(link.failure(rc, "end the tunnel's input"))
+      if localShut && writeClosed then return Ok((up, down))
+      if !progress
+        // Bytes for the tunnel already read off the socket wait in libssh2's queue.
+        val queued = localAt == toLocal.length && !ended && (raw.queued(0) != 0 || raw.atEof() != 0)
+        if !queued
+          val wantsHost = hostBlocked || (localAt == toLocal.length && !ended)
+          val wantsRead = hostAt == toHost.length && !localEnded
+          val wantsWrite = localAt < toLocal.length
+          link.awaitWith("relay the tunnel", local, wantsRead, wantsWrite, wantsHost)?
+
+  // Closes the tunnel's channel, telling the server, which closes its connection to the host. Closing
+  // again does nothing, and so does closing a tunnel whose session was closed.
+  override close() -> Result[unit, IoError]
+    if closed then return Ok(())
+    closed = true
+    if link.closed then return Ok(())
+    link.noteCancelled()
+    link.forget(raw)
+    link.retire(raw)
+    Ok(())
+
+  private usable() -> Result[unit, SshError]
+    if closed then return Err(Closed)
+    link.usable()

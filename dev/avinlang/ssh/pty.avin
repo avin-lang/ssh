@@ -1,0 +1,64 @@
+module dev.avinlang.ssh
+
+// The pseudo-terminal a command or a shell can be given: its type, its size, and the terminal modes
+// set on it.
+
+// A pseudo-terminal for `Session.exec` or `Session.shell`, as `ssh -t` asks for one: `term` is its
+// type, the `TERM` the command sees (`xterm`, `vt100`, `dumb`), `columns` and `rows` its size in
+// characters, and `modes` the terminal modes the server sets on it first, each an opcode of
+// `TerminalMode` with its value (`(TerminalMode.Echo, 0)` turns echo off). Modes not named keep the
+// server's defaults.
+data Pty(term: string = "xterm", columns: int = 80, rows: int = 24, modes: Vector[(int, int)] = [])
+
+impl Pty
+  // `Ok` where the terminal can be asked for: a type of printable ASCII, a size of at least one
+  // column and one row, and modes whose opcodes are those of the protocol, 1 to 159, with values
+  // that are not negative.
+  valid() -> Result[unit, SshError]
+    if term.isEmpty || term.exists(c -> !(' ' < c <= '~'))
+      return Err(Invalid(s"a terminal type of printable ASCII is needed, not \"$term\""))
+    checkSize(columns, rows)?
+    for (opcode, value) in modes
+      if !(1 <= opcode <= 159) then return Err(Invalid(s"no terminal mode has the opcode $opcode"))
+      if value < 0 then return Err(Invalid(s"terminal mode $opcode cannot be $value"))
+    Ok(())
+
+  // The modes as the protocol sends them: each opcode a byte followed by its value in four bytes,
+  // most significant first, and opcode 0 to end them.
+  encodedModes() -> Array[byte]
+    val out = Buffer[byte]()
+    for (opcode, value) in modes
+      out.addOne(byte(opcode))
+      out.addOne(byte((value >> 24) & 255))
+      out.addOne(byte((value >> 16) & 255))
+      out.addOne(byte((value >> 8) & 255))
+      out.addOne(byte(value & 255))
+    out.addOne(byte(0))
+    out.toArray()
+
+// `Ok` where `columns` by `rows` is a terminal's size: at least one of each.
+private checkSize(columns: int, rows: int) -> Result[unit, SshError] =
+  if columns < 1 || rows < 1 then Err(Invalid(s"a terminal of $columns columns and $rows rows")) else Ok(())
+
+// The opcodes of the terminal modes most often set, from the SSH protocol's list (RFC 4254 §8). A
+// flag's value is 1 for on and 0 for off; a character's is its code; a speed's is in bits a second.
+object TerminalMode
+  // The interrupt character, ^C.
+  val Intr = 1
+  // The end-of-file character, ^D.
+  val Eof = 4
+  // Signals from the interrupt, quit and suspend characters.
+  val Isig = 50
+  // Canonical input: a line is read whole, edited with erase and kill.
+  val Icanon = 51
+  // Echo of what is typed.
+  val Echo = 53
+  // Carriage return read as newline on input.
+  val Icrnl = 36
+  // Output processing.
+  val Opost = 70
+  // Newline written as carriage return and newline on output.
+  val Onlcr = 72
+  // The input and output speeds.
+  val InputSpeed = 128
+  val OutputSpeed = 129

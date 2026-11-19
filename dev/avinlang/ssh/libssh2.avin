@@ -258,6 +258,15 @@ private class RawSession
   @c("LIBSSH2_SFTP *libssh2_sftp_init(LIBSSH2_SESSION *self)", keeps: "self")
   sftpInit() -> Option[RawSftp]
 
+  // A `direct-tcpip` channel: the server connects to `host` at `port`, as it sees them, and the
+  // channel carries that connection's bytes. `shost` and `sport` say where the connection came from,
+  // which the server only logs.
+  @c(
+    "LIBSSH2_CHANNEL *libssh2_channel_direct_tcpip_ex(LIBSSH2_SESSION *self, const char *host, int port, const char *shost, int sport)",
+    keeps: "self"
+  )
+  directTcpip(host: string, port: int, shost: string, sport: int) -> Option[RawChannel]
+
 @c(
   "LIBSSH2_SESSION *libssh2_session_init_ex(null void *(*my_alloc)(size_t count, void **abstract), null void (*my_free)(void *ptr, void **abstract), null void *(*my_realloc)(void *ptr, size_t count, void **abstract), null void *abstract)"
 )
@@ -275,6 +284,21 @@ private class RawChannel
     "int libssh2_channel_process_startup(LIBSSH2_CHANNEL *self, const char *request, unsigned int request_len, const char *message, unsigned int message_len)"
   )
   startup(request: string, requestLength: long, message: string, messageLength: long) -> int
+
+  // A request that carries no message, `shell`: the request's packet then ends after its name, as
+  // the protocol has it.
+  @c(
+    "int libssh2_channel_process_startup(LIBSSH2_CHANNEL *self, const char *request, unsigned int request_len, null const char *message, unsigned int message_len)"
+  )
+  startupBare(request: string, requestLength: long, messageLength: long) -> int
+
+  @c(
+    "int libssh2_channel_request_pty_ex(LIBSSH2_CHANNEL *self, const char *term, unsigned int term_len, const char *modes, length(modes) unsigned int modes_len, int width, int height, int width_px, int height_px)"
+  )
+  requestPty(term: string, termLength: long, modes: Array[byte], width: int, height: int, widthPx: int, heightPx: int) -> int
+
+  @c("int libssh2_channel_request_pty_size_ex(LIBSSH2_CHANNEL *self, int width, int height, int width_px, int height_px)")
+  requestPtySize(width: int, height: int, widthPx: int, heightPx: int) -> int
 
   @c("ssize_t libssh2_channel_read_ex(LIBSSH2_CHANNEL *self, int stream_id, char *buf, length(buf) size_t buflen)")
   readInto(stream: int, buf: Array[byte]) -> long

@@ -50,7 +50,15 @@ private val ChunkSize = 32768
 // it, after which every operation answers `Closed`. Output nobody reads is held by libssh2 up to the
 // channel's window, two megabytes, and the server then waits: a command whose input is written while
 // its output is not read stops once that much has come back.
-class Exec(private val link: Link, private val raw: RawChannel, private val mode: StderrMode): io.ByteWriter, io.Close
+//
+// A command started with a pseudo-terminal, or a shell, reads and writes the terminal: its standard
+// error arrives merged into its standard output, and `resize` tells it the terminal's new size.
+class Exec(
+    private val link: Link,
+    private val raw: RawChannel,
+    private val mode: StderrMode,
+    private val onTerminal: bool = false
+): io.ByteWriter, io.Close
   private var closed = false
   // Whether each stream has ended.
   private var outDone = false
@@ -148,6 +156,19 @@ class Exec(private val link: Link, private val raw: RawChannel, private val mode
       return Err(Invalid(s"no signal is named \"$name\""))
     val rc = link.retrying("signal the command", () -> raw.signal(name, long(name.byteLength)))?
     if rc < 0 then Err(link.failure(rc, "signal the command")) else Ok(())
+
+  // Whether the command runs on a pseudo-terminal.
+  hasPty -> bool = onTerminal
+
+  // Tells the command its terminal is now `columns` wide and `rows` high, as a terminal window
+  // resized does; the server passes it on, and the command is sent `SIGWINCH`. `Invalid` for a
+  // command with no terminal, or a size under one column or one row.
+  resize(columns: int, rows: int) -> Result[unit, SshError]
+    usable()?
+    if !onTerminal then return Err(Invalid("the command has no terminal to resize"))
+    checkSize(columns, rows)?
+    val rc = link.retrying("resize the terminal", () -> raw.requestPtySize(columns, rows, 0, 0))?
+    if rc < 0 then Err(link.failure(rc, "resize the terminal")) else Ok(())
 
   // Closes the command's channel, telling the server, after sending `TERM` to a command whose output
   // has not ended, which ends it unless it handles the signal. Closing again does nothing, and so does

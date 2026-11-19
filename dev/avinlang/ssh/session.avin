@@ -145,14 +145,38 @@ class Session(private val link: Link): io.Close
 
   // Starts `command` on a channel of its own and answers the running command, to read its output and
   // exit status from and write its input to. `stderr` says what becomes of its standard error.
-  exec(command: string, stderr: StderrMode = Separate) -> Result[Exec, SshError]
+  //
+  // With a `pty`, the server gives the command a pseudo-terminal of that type and size first, as
+  // `ssh -t` does: the command's standard input, output and error are then the terminal, so its
+  // standard error arrives merged into standard output, whatever `stderr` says, and a line written to
+  // its input is echoed back as a terminal echoes it. `ChannelRefused` where the server will not give
+  // it a terminal.
+  exec(command: string, stderr: StderrMode = Separate, pty: Option[Pty] = None) -> Result[Exec, SshError]
     link.usable()?
     noNul(command, "command")?
+    started(Some(command), stderr, pty)
+
+  // Starts the user's login shell on a channel of its own, as `ssh host` does with no command, and
+  // answers it running: what is written to it is typed into the shell, and its output is read as a
+  // command's. With a `pty`, the default, the shell is interactive on a terminal of that type and
+  // size, prompting and echoing as it does for a person, its standard error merged into its standard
+  // output; with none, it reads commands from its input without prompting, `stderr` saying what
+  // becomes of its standard error.
+  shell(pty: Option[Pty] = Some(Pty()), stderr: StderrMode = Separate) -> Result[Exec, SshError]
+    link.usable()?
+    started(None, stderr, pty)
+
+  // A channel running `command`, or the shell where there is none, on a terminal where `pty` asks for
+  // one.
+  private started(command: Option[string], stderr: StderrMode, pty: Option[Pty]) -> Result[Exec, SshError]
+    pty match
+      Some(p) -> p.valid()?
+      None -> ()
     if !link.raw.authenticated() then return Err(NotAuthenticated)
     val ch = link.channel()?
-    var started = false
+    var running = false
     defer
-      if !started then link.retire(ch)
+      if !running then link.retire(ch)
     val mode = stderr match
       Separate -> -1
       Merge -> extendedMerge
@@ -160,11 +184,22 @@ class Session(private val link: Link): io.Close
     if mode >= 0
       val rc = link.retrying("start the command", () -> ch.extendedData(mode))?
       if rc < 0 then return Err(link.failure(rc, "start the command"))
-    val rc = link.retrying("start the command", () -> ch.startup("exec", 4, command, long(command.byteLength)))?
-    if rc < 0 then return Err(link.failure(rc, "start the command"))
-    started = true
+    pty match
+      Some(p) ->
+        val modes = p.encodedModes()
+        val rc = link.retrying(
+          "ask for a terminal",
+          () -> ch.requestPty(p.term, long(p.term.byteLength), modes, p.columns, p.rows, 0, 0)
+        )?
+        if rc < 0 then return Err(link.failure(rc, "ask for a terminal"))
+      None -> ()
+    val rc = command match
+      Some(c) -> link.retrying("start the command", () -> ch.startup("exec", 4, c, long(c.byteLength)))?
+      None -> link.retrying("start the shell", () -> ch.startupBare("shell", 5, 0))?
+    if rc < 0 then return Err(link.failure(rc, if command.isDefined then "start the command" else "start the shell"))
+    running = true
     link.channels.addOne(ch)
-    Ok(Exec(link, ch, stderr))
+    Ok(Exec(link, ch, if pty.isDefined then Merge else stderr, pty.isDefined))
 
   // Runs `command` to its end and answers its exit status and output: at most `limit` bytes of each of
   // standard output and standard error, the rest read and dropped, `truncated` saying whether any was.
@@ -182,6 +217,19 @@ class Session(private val link: Link): io.Close
         None -> break
     val status = e.wait()?
     Ok(Output(status, out.toArray(), err.toArray(), truncated))
+
+  // Asks the server to make a TCP connection to `host` at `port`, as the server sees them
+  // (`localhost` is the server itself), and answers it as a `Tunnel` to read and write: `ssh -L`'s
+  // forwarding of one connection. `ChannelRefused` where the server cannot connect there or does not
+  // allow forwarding, the server's reason in it; the session goes on.
+  tunnel(host: string, port: int) -> Result[Tunnel, SshError]
+    link.usable()?
+    noNul(host, "host")?
+    if !(0 <= port <= 65535) then return Err(Invalid(s"no TCP port is numbered $port"))
+    if !link.raw.authenticated() then return Err(NotAuthenticated)
+    val ch = link.tunnel(host, port)?
+    link.channels.addOne(ch)
+    Ok(Tunnel(link, ch, host, port))
 
   // Starts the SFTP subsystem, to transfer files over. `ChannelRefused` where the server runs none.
   sftp() -> Result[Sftp, SshError]
@@ -205,35 +253,43 @@ object Session
     val init = ready()
     if init != 0 then return Err(Failed(init, "libssh2 could not be initialized"))
     noNul(host, "host")?
-    options.connectTimeout match
-      Some(d) if d.micros > 0 -> withTimeout(d, _ -> opened(host, port, options)) match
-        Some(r) -> r
-        None -> Err(Connect(IoError(io.TimedOut, "connect to", s"$host:$port")))
-      _ -> opened(host, port, options)
+    connectThrough(host, port, host, port, options)
 
-  // The session, connected, shaken hands with and checked.
-  private opened(host: string, port: int, options: Options) -> Result[Session, SshError]
-    val tcp = TcpStream.connect(host, port).mapErr(e -> Connect(e))?
-    val fd = dupRaw(tcp.readinessDescriptor())
-    _ = tcp.close()
-    val sock = fd match
-      Ok(n) -> n
-      Err(e) -> return Err(Connect(IoError(io.Other(e.message), "connect to", s"$host:$port")))
-    val raw = sessionInit() match
+// A session over a TCP connection to `tcpHost` at `tcpPort`, its host key checked as that of `host` at
+// `port`: the same where the connection goes straight to the server, a local end of a tunnel where it
+// goes through a jump host.
+private connectThrough(tcpHost: string, tcpPort: int, host: string, port: int, options: Options) -> Result[Session, SshError]
+  val init = ready()
+  if init != 0 then return Err(Failed(init, "libssh2 could not be initialized"))
+  options.connectTimeout match
+    Some(d) if d.micros > 0 -> withTimeout(d, _ -> opened(tcpHost, tcpPort, host, port, options)) match
       Some(r) -> r
-      None ->
-        _ = closeRaw(sock)
-        return Err(Failed(0, "libssh2 could not make a session"))
-    raw.setBlocking(0)
-    val link = Link(raw, Socket(sock), host, port, options)
-    var done = false
-    defer
-      if !done then link.abandon()
-    link.handshake()?
-    verifyHostKey(raw, host, port, options.hostKeys, options.knownHosts.getOrElse(defaultKnownHosts()))?
-    options.keepalive.foreach(d -> raw.keepaliveConfig(1, if d.micros < 2000000 then 2 else d.micros / 1000000))
-    done = true
-    Ok(Session(link))
+      None -> Err(Connect(IoError(io.TimedOut, "connect to", s"$host:$port")))
+    _ -> opened(tcpHost, tcpPort, host, port, options)
+
+// The session, connected, shaken hands with and checked.
+private opened(tcpHost: string, tcpPort: int, host: string, port: int, options: Options) -> Result[Session, SshError]
+  val tcp = TcpStream.connect(tcpHost, tcpPort).mapErr(e -> Connect(e))?
+  val fd = dupRaw(tcp.readinessDescriptor())
+  _ = tcp.close()
+  val sock = fd match
+    Ok(n) -> n
+    Err(e) -> return Err(Connect(IoError(io.Other(e.message), "connect to", s"$host:$port")))
+  val raw = sessionInit() match
+    Some(r) -> r
+    None ->
+      _ = closeRaw(sock)
+      return Err(Failed(0, "libssh2 could not make a session"))
+  raw.setBlocking(0)
+  val link = Link(raw, Socket(sock), host, port, options)
+  var done = false
+  defer
+    if !done then link.abandon()
+  link.handshake()?
+  verifyHostKey(raw, host, port, options.hostKeys, options.knownHosts.getOrElse(defaultKnownHosts()))?
+  options.keepalive.foreach(d -> raw.keepaliveConfig(1, if d.micros < 2000000 then 2 else d.micros / 1000000))
+  done = true
+  Ok(Session(link))
 
 // Fails with `Invalid` where `text` holds U+0000, which C would read as its end.
 private noNul(text: string, what: string) -> Result[unit, SshError] =

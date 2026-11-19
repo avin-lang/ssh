@@ -1,0 +1,355 @@
+module tests
+
+// `~/.ssh/config`: every keyword the package uses, the defaults, `Host` patterns and their negation,
+// first value wins, `Include` with globs and relative paths, `Match` and its refusals, the line
+// syntax, the `~` and `%` expansions, files that are missing or wrong, and sessions made by alias,
+// straight and through jump hosts.
+import avin.fs
+import avin.process
+import avin.time.seconds
+
+import dev.avinlang.ssh.{
+  AcceptNew, Config, Connect, HostConfig, Options, Pinned, Session, SshConfig, SshError, Strict
+}
+
+// The configuration `text` holds, which the test expects to be read.
+parsedConfig(text: string, dir: string = ".") -> SshConfig = made(SshConfig.parse(text, "test_config", dir))
+
+// What `text` says about `alias`.
+hostIn(text: string, alias: string) -> HostConfig = made(parsedConfig(text).host(alias))
+
+// The `Config` error reading `text` answers: its line and its reason.
+refusal(text: string) -> (int, string) = SshConfig.parse(text, "test_config") match
+  Ok(c) -> fail("the configuration was read")
+  Err(Config(file, line, reason)) ->
+    assertEq(file, "test_config")
+    (line, reason)
+  Err(e) -> fail(s"not a Config error: ${e.message}")
+
+home() -> string = process.homeDir().getOrElse("")
+
+@test("every keyword the package uses is read")
+everyKeyword()
+  val h = hostIn(
+    "Host web\n  HostName web.example.com\n  User deploy\n  Port 2222\n  IdentityFile /keys/a\n  IdentityFile /keys/b\n  ProxyJump bastion\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile /keys/known\n  ConnectTimeout 7\n  ServerAliveInterval 15\n  IdentitiesOnly yes\n",
+    "web"
+  )
+  assertEq(h.alias, "web")
+  assertEq(h.hostName, "web.example.com")
+  assertEq(h.user, "deploy")
+  assertEq(h.port, 2222)
+  assertEq(h.identityFiles, ["/keys/a", "/keys/b"])
+  assertEq(h.proxyJump, Some("bastion"))
+  assert(h.hostKeys is Some(AcceptNew))
+  assertEq(h.knownHosts, Some("/keys/known"))
+  assertEq(h.connectTimeout, Some(7.seconds))
+  assertEq(h.keepalive, Some(15.seconds))
+  assert(h.identitiesOnly)
+
+@test("a host the configuration does not mention gets the defaults")
+defaults()
+  val h = hostIn("Host other\n  Port 1\n", "plain.example.com")
+  assertEq(h.hostName, "plain.example.com")
+  assertEq(h.user, process.env("USER").getOrElse(""))
+  assertEq(h.port, 22)
+  assertEq(h.identityFiles.length, 0)
+  assertEq(h.proxyJump, None)
+  assertEq(h.hostKeys, None)
+  assertEq(h.knownHosts, None)
+  assertEq(h.connectTimeout, None)
+  assertEq(h.keepalive, None)
+  assert(!h.identitiesOnly)
+  assert(failure(parsedConfig("").host("")) is dev.avinlang.ssh.Invalid(_))
+  // The configuration from no text at all.
+  assertEq(made(made(SshConfig.parse("")).host("plain.example.com")), h)
+
+@test("StrictHostKeyChecking: yes and ask are Strict, accept-new, no and off AcceptNew, in any case")
+strictness()
+  for (v, strict) in [("yes", true), ("ASK", true), ("accept-new", false), ("No", false), ("off", false)]
+    val h = hostIn(s"StrictHostKeyChecking $v\n", "x")
+    if strict then assert(h.hostKeys is Some(Strict)) else assert(h.hostKeys is Some(AcceptNew))
+  assertEq(refusal("StrictHostKeyChecking maybe\n").0, 1)
+
+@test("ProxyJump none is no jump host, and 0 seconds is no timeout and no keepalive")
+noneAndZero()
+  val h = hostIn("ProxyJump none\nConnectTimeout 0\nServerAliveInterval 0\nIdentitiesOnly no\n", "x")
+  assertEq(h.proxyJump, None)
+  assertEq(h.connectTimeout, None)
+  assertEq(h.keepalive, None)
+  assert(!h.identitiesOnly)
+
+@test("Host patterns: * and ?, several on a line, any one fitting, case not mattering")
+patterns()
+  val text = "Host *.example.com db? Exact\n  User matched\n"
+  assertEq(hostIn(text, "www.example.com").user, "matched")
+  assertEq(hostIn(text, "WWW.Example.COM").user, "matched")
+  assertEq(hostIn(text, "db1").user, "matched")
+  assertEq(hostIn(text, "exact").user, "matched")
+  assert(hostIn(text, "db12").user != "matched")
+  assert(hostIn(text, "example.com").user != "matched")
+  assert(hostIn(text, "www.example.community").user != "matched")
+  assertEq(hostIn("Host *\n User all\n", "anything").user, "all")
+  assertEq(hostIn("Host a*b*c\n User m\n", "aXXbYYc").user, "m")
+  assert(hostIn("Host a*b*c\n User m\n", "aXXbYY").user != "m")
+
+@test("a negated pattern that fits wins over every other, and negation alone fits nothing")
+negation()
+  val text = "Host *.example.com !secret.example.com\n  User public\nHost *\n  User fallback\n"
+  assertEq(hostIn(text, "www.example.com").user, "public")
+  assertEq(hostIn(text, "secret.example.com").user, "fallback")
+  // The negation's place on the line does not matter.
+  assertEq(
+    hostIn("Host !secret.example.com *.example.com\n User public\n", "secret.example.com").user,
+    process.env("USER").getOrElse("")
+  )
+  // A block of negations alone applies to no host.
+  assertEq(hostIn("Host !foo\n Port 2000\n", "bar").port, 22)
+  assertEq(hostIn("Host !foo\n Port 2000\n", "foo").port, 22)
+
+@test("the first value that applies wins, and every IdentityFile that applies is kept, once each")
+firstWins()
+  val text = "Host web\n  User first\n  Port 1000\n  IdentityFile /k/web\nHost *\n  User second\n  Port 2000\n  HostName fallback\n  IdentityFile /k/all\n  IdentityFile /k/web\n"
+  val h = hostIn(text, "web")
+  assertEq(h.user, "first")
+  assertEq(h.port, 1000)
+  assertEq(h.hostName, "fallback")
+  assertEq(h.identityFiles, ["/k/web", "/k/all"])
+  // Settings before the first Host apply to every host, and come first.
+  assertEq(hostIn("User top\nHost web\n  User later\n", "web").user, "top")
+
+@test("comments, = between a keyword and its value, quotes, blanks and case-insensitive keywords")
+lineSyntax()
+  val text = "# a comment\n\n   # an indented comment\nHOST web\n\tHostName=web.example.com\n  user = deploy # a trailing comment\n  pOrT =2200\n  IdentityFile \"/path with spaces/key\"\n  IdentityFile=\"/quoted=equals\"\r\n"
+  val h = hostIn(text, "web")
+  assertEq(h.hostName, "web.example.com")
+  assertEq(h.user, "deploy")
+  assertEq(h.port, 2200)
+  assertEq(h.identityFiles, ["/path with spaces/key", "/quoted=equals"])
+
+@test("~ and the % tokens are expanded in IdentityFile and UserKnownHostsFile, %h in HostName")
+expansion()
+  val text = "Host web\n  HostName %h.example.com\n  User deploy\n  Port 2022\n  IdentityFile ~/.ssh/%n_%r\n  IdentityFile %d/%h-%p-%u-100%%\n  IdentityFile ~\n  UserKnownHostsFile ~/known/%h\n"
+  val h = hostIn(text, "web")
+  assertEq(h.hostName, "web.example.com")
+  val me = process.env("USER").getOrElse("")
+  assertEq(h.identityFiles, [s"${home()}/.ssh/web_deploy", s"${home()}/web.example.com-2022-$me-100%", home()])
+  assertEq(h.knownHosts, Some(s"${home()}/known/web.example.com"))
+  // A ~ elsewhere than at the start, or before a user's name, is left as it is.
+  assertEq(hostIn("IdentityFile /a/~/b\nIdentityFile ~other/k\n", "x").identityFiles, ["/a/~/b", "~other/k"])
+  // An unknown token is refused, naming it.
+  parsedConfig("IdentityFile /k/%z\n").host("x") match
+    Err(Config(_, _, reason)) -> assert(reason.contains("%z"))
+    _ -> fail("an unknown token was taken")
+  assert(failure(parsedConfig("IdentityFile /k/%\n").host("x")) is Config(_, _, _))
+
+@test("Include reads the files a glob names, in order, relative to the first file's directory")
+include()
+  val d = local(fs.tempDir("ssh-config-test"))
+  defer _ = d.close()
+  local(fs.createDir(s"${d.path}/conf.d"))
+  local(fs.writeText(s"${d.path}/conf.d/b.conf", "Host web\n  User from-b\n  IdentityFile /k/b\n"))
+  local(fs.writeText(s"${d.path}/conf.d/a.conf", "Host web\n  Port 2001\n  IdentityFile /k/a\n"))
+  local(fs.writeText(s"${d.path}/conf.d/skip.txt", "Host web\n  User from-txt\n"))
+  local(fs.writeText(s"${d.path}/extra", "HostName extra.example.com\n"))
+  local(fs.writeText(s"${d.path}/config", "Include conf.d/*.conf\nHost web\n  User from-main\n"))
+  val c = made(SshConfig.read(s"${d.path}/config"))
+  assertEq(c.path, s"${d.path}/config")
+  val h = made(c.host("web"))
+  assertEq(h.user, "from-b")
+  assertEq(h.port, 2001)
+  assertEq(h.identityFiles, ["/k/a", "/k/b"])
+  // An absolute path, and a file that does not exist, which is passed over.
+  local(fs.writeText(s"${d.path}/config2", s"Include ${d.path}/extra ${d.path}/none-such\n"))
+  assertEq(made(made(SshConfig.read(s"${d.path}/config2")).host("x")).hostName, "extra.example.com")
+
+@test("an Include inside a Host block counts only for that block's hosts, and its own Host lines stay in it")
+includeInBlock()
+  val d = local(fs.tempDir("ssh-config-test"))
+  defer _ = d.close()
+  local(fs.writeText(s"${d.path}/inner", "Port 3000\nHost other\n  User inner-other\n"))
+  local(fs.writeText(s"${d.path}/config", "Host web\n  Include inner\n  User web-user\n"))
+  val c = made(SshConfig.read(s"${d.path}/config"))
+  val web = made(c.host("web"))
+  assertEq(web.port, 3000)
+  // The included file's `Host other` ended at its end: the block of `web` goes on after it.
+  assertEq(web.user, "web-user")
+  assertEq(made(c.host("db")).port, 22)
+  assertEq(made(c.host("other")).user, process.env("USER").getOrElse(""))
+
+@test("an Include that includes itself stops at sixteen deep, saying so")
+includeLoop()
+  val d = local(fs.tempDir("ssh-config-test"))
+  defer _ = d.close()
+  local(fs.writeText(s"${d.path}/config", "Include config\n"))
+  SshConfig.read(s"${d.path}/config") match
+    Err(Config(_, 1, reason)) -> assert(reason.contains("16"))
+    Err(e) -> fail(s"expected a Config error, got ${e.message}")
+    Ok(_) -> fail("the configuration was read")
+
+@test("Match host fits the host name set so far, Match user the user, Match all every host")
+matching()
+  val text = "Host web\n  HostName real.example.com\nMatch host real.example.com\n  Port 2200\nMatch host *.example.com,!real.example.com\n  Port 2300\nHost web db\n  User deploy\nMatch user deploy\n  IdentityFile /k/deploy\nMatch user root\n  IdentityFile /k/root\nMatch all\n  ConnectTimeout 9\n"
+  val web = hostIn(text, "web")
+  assertEq(web.port, 2200)
+  assertEq(web.identityFiles, ["/k/deploy"])
+  assertEq(web.connectTimeout, Some(9.seconds))
+  assertEq(hostIn(text, "www.example.com").port, 2300)
+  val db = hostIn(text, "db")
+  assertEq(db.port, 22)
+  assertEq(db.identityFiles, ["/k/deploy"])
+  assertEq(hostIn(text, "x").identityFiles.length, 0)
+  // `Match host` before any HostName fits the alias; `Match host` and `user` together need both.
+  assertEq(hostIn("Match host web user nobody\n  Port 1\nMatch host web\n  Port 2\n", "web").port, 2)
+  assertEq(hostIn("Match HOST web\n  Port 3\n", "WEB").port, 3)
+
+@test("a Match criterion other than host, user and all is refused, naming it and its line")
+matchRefusals()
+  for criterion in [
+    "exec \"true\"",
+    "canonical",
+    "final",
+    "localuser me",
+    "originalhost x",
+    "localnetwork 10.0.0.0/8",
+    "tagged t",
+    "!host x"
+  ]
+    val (line, reason) = refusal(s"Host a\n  Port 1\nMatch $criterion\n  Port 2\n")
+    assertEq(line, 3)
+    assert(reason.contains("not supported"))
+  assertEq(refusal("Match\n").0, 1)
+  assertEq(refusal("Match host\n").0, 1)
+  assertEq(refusal("Match user\n").0, 1)
+  assertEq(refusal("Match all host x\n").0, 1)
+
+@test("a value the package cannot use is refused with its line; keywords it does not use are passed over")
+badValues()
+  assertEq(refusal("Host a\nPort abc\n"), (2, "Port abc is not a TCP port"))
+  assertEq(refusal("Port 0\n").0, 1)
+  assertEq(refusal("Port 65536\n").0, 1)
+  assertEq(refusal("\n\nConnectTimeout soon\n").0, 3)
+  assertEq(refusal("ServerAliveInterval -1\n").0, 1)
+  assertEq(refusal("IdentitiesOnly maybe\n").0, 1)
+  assertEq(refusal("Host\n").0, 1)
+  assertEq(refusal("User\n").0, 1)
+  assertEq(refusal("Include\n").0, 1)
+  assertEq(refusal("IdentityFile \"/no/closing\n").0, 1)
+  // Keywords the package does not use, with any arguments or none.
+  assertEq(hostIn("ForwardAgent yes\nCompression\nLocalForward 8080 localhost:80\nPort 2\n", "x").port, 2)
+  // One with no arguments in a block that applies, and in one that does not.
+  assertEq(hostIn("Host x\n  Compression\n  Port 3\nHost y\n  Compression\n", "x").port, 3)
+  assertEq(hostIn("Host x\n  Compression\n  Port 3\nHost y\n  Compression\n", "y").port, 22)
+
+@test(
+  "a file that does not exist is Config naming it; load answers an empty configuration where ~/.ssh/config is missing"
+)
+missingConfig()
+  SshConfig.read("/no/such/dir/config") match
+    Err(Config(path, 0, reason)) ->
+      assertEq(path, "/no/such/dir/config")
+      assert(reason.nonEmpty)
+    Err(e) -> fail(s"expected a Config error, got ${e.message}")
+    Ok(_) -> fail("a missing file was read")
+  assert(SshConfig.load().isOk)
+
+@test("options take the configuration's settings in place of the base's, keeping the rest")
+optionsFrom()
+  val h = hostIn(
+    "ConnectTimeout 4\nServerAliveInterval 20\nStrictHostKeyChecking accept-new\nUserKnownHostsFile /k/known\n",
+    "x"
+  )
+  val base = Options(timeout = Some(30.seconds), hostKeys = Pinned("SHA256:x"), closeTimeout = 2.seconds)
+  val o = h.options(base)
+  assertEq(o.connectTimeout, Some(4.seconds))
+  assertEq(o.keepalive, Some(20.seconds))
+  assert(o.hostKeys is AcceptNew)
+  assertEq(o.knownHosts, Some("/k/known"))
+  assertEq(o.timeout, Some(30.seconds))
+  assertEq(o.closeTimeout, 2.seconds)
+  // What the configuration does not set comes from the base.
+  val bare = hostIn("", "x").options(base)
+  assert(bare.hostKeys is Pinned("SHA256:x"))
+  assertEq(bare.connectTimeout, None)
+
+// A configuration for the test server: `testbox` is it, logged in with the client key, its host key
+// checked against its own file.
+serverConfig(dir: string, port: int, user: string, extra: string = "") -> SshConfig =
+  parsedConfig(
+    s"Host testbox\n  HostName 127.0.0.1\n  Port $port\n$extra\nHost *\n  User $user\n  IdentityFile $dir/client\n  UserKnownHostsFile $dir/known_hosts\n  StrictHostKeyChecking yes\n  ConnectTimeout 20\n"
+  )
+
+@test("connect by alias resolves the host through the configuration and logs in")
+connectByAlias()
+  if server() is Some((dir, port, user))
+    val s = made(serverConfig(dir, port, user).connect("testbox", Options(timeout = Some(30.seconds))))
+    defer _ = s.close()
+    assert(s.isAuthenticated)
+    assertEq(s.host, "127.0.0.1")
+    assertEq(s.port, port)
+    assertEq(made(s.run("echo by-alias")).stdoutText, "by-alias\n")
+
+@test("IdentitiesOnly logs in with the identity file alone, and a key the server refuses is AuthFailed")
+identitiesOnly()
+  if server() is Some((dir, port, user))
+    val c = serverConfig(dir, port, user, "  IdentitiesOnly yes")
+    val s = made(c.connect("testbox"))
+    assert(s.isAuthenticated)
+    _ = s.close()
+    val stranger = parsedConfig(
+      s"Host testbox\n  HostName 127.0.0.1\n  Port $port\n  User $user\n  IdentitiesOnly yes\n  IdentityFile $dir/stranger\n  UserKnownHostsFile $dir/known_hosts\n"
+    )
+    assert(failure(stranger.connect("testbox")) is dev.avinlang.ssh.AuthFailed(_, _))
+
+@test("connect by alias checks the host key under the configuration's known-hosts file")
+aliasHostKey()
+  if server() is Some((dir, port, user))
+    val c = parsedConfig(
+      s"Host testbox\n  HostName 127.0.0.1\n  Port $port\n  User $user\n  UserKnownHostsFile $dir/other_hosts\n"
+    )
+    assert(failure(c.connect("testbox")) is dev.avinlang.ssh.ChangedHostKey(_, _, _))
+
+@test("connect through a ProxyJump host reaches the target, its key checked under its own name")
+proxyJump()
+  if server() is Some((dir, port, user))
+    val c = serverConfig(dir, port, user, s"Host target\n  HostName localhost\n  Port $port\n  ProxyJump testbox")
+    val s = made(c.connect("target"))
+    defer _ = s.close()
+    assertEq(s.host, "localhost")
+    assertEq(s.port, port)
+    assertEq(made(s.run("echo jumped")).stdoutText, "jumped\n")
+    // A second command, and SFTP, through the same jump.
+    assert(made(s.run("true")).success)
+
+@test("ProxyJump through two hosts, and written user@host:port")
+proxyJumpTwice()
+  if server() is Some((dir, port, user))
+    val c = serverConfig(
+      dir,
+      port,
+      user,
+      s"Host target\n  HostName localhost\n  Port $port\n  ProxyJump testbox,$user@127.0.0.1:$port\nHost target2\n  HostName localhost\n  Port $port\n  ProxyJump ssh://[127.0.0.1]:$port"
+    )
+    val s = made(c.connect("target"))
+    assertEq(made(s.run("echo twice")).stdoutText, "twice\n")
+    _ = s.close()
+    val s2 = made(c.connect("target2"))
+    assertEq(made(s2.run("echo bracketed")).stdoutText, "bracketed\n")
+    _ = s2.close()
+
+@test("a jump host that cannot be reached gives its own error, and a bad ProxyJump is Config")
+proxyJumpFails()
+  if server() is Some((dir, port, user))
+    val dead = closedPort()
+    val c = serverConfig(
+      dir,
+      port,
+      user,
+      s"Host nowhere\n  HostName 127.0.0.1\n  Port $dead\nHost viaDead\n  HostName localhost\n  Port $port\n  ProxyJump nowhere\nHost toDead\n  HostName 127.0.0.1\n  Port $dead\n  ProxyJump testbox\nHost bad1\n  ProxyJump user@[::1\nHost bad2\n  ProxyJump host:notaport\nHost bad3\n  ProxyJump ,\nHost loop\n  ProxyJump loop"
+    )
+    assert(failure(c.connect("viaDead")) is Connect(_))
+    assert(failure(c.connect("toDead")) is dev.avinlang.ssh.ChannelRefused(_))
+    for alias in ["bad1", "bad2", "bad3"]
+      assert(failure(c.connect(alias)) is Config(_, _, _))
+    failure(c.connect("loop")) match
+      Config(_, _, reason) -> assert(reason.contains("more than"))
+      other -> fail(s"expected a Config error, got ${other.message}")

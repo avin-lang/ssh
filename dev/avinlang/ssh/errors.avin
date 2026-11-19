@@ -53,6 +53,9 @@ data SshError
   // A value the operation was given cannot be sent: a command or a path holding U+0000, a negative
   // limit.
   Invalid(reason: string)
+  // An SSH configuration file could not be read or used: `path` is the file, `line` the line at fault
+  // (0 where the fault is not one line's), `reason` what is wrong.
+  Config(path: string, line: int, reason: string)
   // Any other failure libssh2 reported: its error code and its words.
   Failed(code: int, reason: string)
 
@@ -88,6 +91,8 @@ impl Error for SshError
     NotAuthenticated -> "the session has not logged in"
     Interrupted -> "an earlier operation on the session was interrupted, so it cannot be used"
     Invalid(reason) -> reason
+    Config(path, 0, reason) -> s"$path: $reason"
+    Config(path, line, reason) -> s"$path:$line: $reason"
     Failed(code, reason) -> s"libssh2 error $code: $reason"
 
   cause -> Option[Error] = self match

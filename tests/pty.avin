@@ -1,0 +1,207 @@
+module tests
+
+// Pseudo-terminals: a command given one and one not, the size asked for and a resize, terminal modes,
+// standard error merged into standard output, an interactive shell and one without a terminal, a
+// terminal the server refuses, and the values a terminal cannot have.
+import dev.avinlang.ssh.{
+  ChannelRefused, Exec, Exited, Invalid, Merge, NotAuthenticated, Pty, Session, Stderr, Stdout, TerminalMode
+}
+
+// What `e` writes until `wanted` has appeared in it, all of it as text; fails where it ends first.
+upTo(e: Exec, wanted: string) -> string
+  val seen = Buffer[byte]()
+  loop
+    made(e.next()) match
+      Some(Stdout(b)) -> seen.addAll(b)
+      Some(Stderr(b)) -> fail(s"standard error under a terminal: ${string.fromUtf8Lossy(b)}")
+      None -> fail(s"the output ended before \"$wanted\": ${string.fromUtf8Lossy(seen.toArray())}")
+    val text = string.fromUtf8Lossy(seen.toArray())
+    if text.contains(wanted) then return text
+
+// Everything `e` writes to its end, as text; standard error on its own.
+allOf(e: Exec) -> (string, string)
+  val out = Buffer[byte]()
+  val err = Buffer[byte]()
+  loop
+    made(e.next()) match
+      Some(Stdout(b)) -> out.addAll(b)
+      Some(Stderr(b)) -> err.addAll(b)
+      None -> break
+  (string.fromUtf8Lossy(out.toArray()), string.fromUtf8Lossy(err.toArray()))
+
+// The words of `text`, split on blanks and line ends.
+wordsOf(text: string) -> Vector[string] =
+  text.replace("\r", " ").replace("\n", " ").replace("\t", " ").split(' ').filter(w -> w.nonEmpty)
+
+@test("tty under a pty names a terminal device, and without one answers not a tty")
+ttyDevice()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val plain = made(s.run("tty"))
+    assertEq(plain.stdoutText.trim, "not a tty")
+    assert(plain.status is Exited(1))
+    val e = made(s.exec("tty", pty = Some(Pty())))
+    defer _ = e.close()
+    assert(e.hasPty)
+    val (out, err) = allOf(e)
+    assert(out.trim.startsWith("/dev/"))
+    assertEq(err, "")
+    assert(made(e.wait()).success)
+    val bare = made(s.exec("true"))
+    assert(!bare.hasPty)
+    _ = bare.close()
+
+@test("the terminal has the type asked for, and the size, which a resize changes")
+sizeAndResize()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = made(s.exec("echo term=$TERM; stty size; read line; stty size", pty = Some(Pty("vt100", 100, 40))))
+    defer _ = e.close()
+    val first = upTo(e, "40 100")
+    assert(first.contains("term=vt100"))
+    made(e.resize(132, 50))
+    made(e.stdin("go\n".utf8))
+    upTo(e, "50 132")
+    assert(made(e.wait()).success)
+
+@test("standard error under a terminal arrives merged into standard output, whatever was asked")
+mergedUnderPty()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = made(s.exec("echo out; echo err >&2; exit 2", pty = Some(Pty())))
+    defer _ = e.close()
+    val (out, err) = allOf(e)
+    assertEq(err, "")
+    assert(out.contains("out\r\n"))
+    assert(out.contains("err\r\n"))
+    assert(made(e.wait()) is Exited(2))
+
+@test("terminal modes are set before the command runs: echo off, then the default on")
+modes()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val off = made(s.exec("stty -a", pty = Some(Pty(modes = [(TerminalMode.Echo, 0), (TerminalMode.Icanon, 0)]))))
+    val (offText, _) = allOf(off)
+    _ = off.close()
+    assert(wordsOf(offText).contains("-echo"))
+    assert(wordsOf(offText).contains("-icanon"))
+    val on = made(s.exec("stty -a", pty = Some(Pty())))
+    val (onText, _) = allOf(on)
+    _ = on.close()
+    assert(wordsOf(onText).contains("echo"))
+    assert(!wordsOf(onText).contains("-echo"))
+
+@test("the modes are encoded as the protocol has them: opcode, four bytes of value, and 0 to end")
+encodedModes()
+  assertEq(Pty().encodedModes().toVector, [byte(0)])
+  val bytes = Pty(
+    modes = [(TerminalMode.Echo, 0), (TerminalMode.InputSpeed, 38400), (TerminalMode.Intr, 3)]
+  ).encodedModes()
+  val expected = [53, 0, 0, 0, 0, 128, 0, 0, 150, 0, 1, 0, 0, 0, 3, 0].map(n -> byte(n))
+  assertEq(bytes.toVector, expected)
+
+@test("an interactive shell on a terminal runs what is typed, and exit ends it")
+interactiveShell()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val sh = made(s.shell())
+    defer _ = sh.close()
+    assert(sh.hasPty)
+    // The terminal echoes the line typed, so the output is told from the echo by the quotes.
+    made(sh.stdin("echo h\"\"i\n".utf8))
+    upTo(sh, "hi\r\n")
+    made(sh.stdin("exit 5\n".utf8))
+    _ = allOf(sh)
+    assert(made(sh.wait()) is Exited(5))
+
+@test("a shell with no terminal reads commands from its input without prompting")
+plainShell()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val sh = made(s.shell(pty = None))
+    defer _ = sh.close()
+    assert(!sh.hasPty)
+    made(sh.stdin("echo hi\necho oops >&2\nexit 3\n".utf8))
+    made(sh.closeStdin())
+    assertEq(allOf(sh), ("hi\n", "oops\n"))
+    assert(made(sh.wait()) is Exited(3))
+    // With standard error merged, as a command's.
+    val merged = made(s.shell(pty = None, stderr = Merge))
+    made(merged.stdin("echo a; echo b >&2\n".utf8))
+    made(merged.closeStdin())
+    // The two streams are merged as they arrive, so their order is not fixed.
+    val (mergedOut, mergedErr) = allOf(merged)
+    assertEq(mergedErr, "")
+    assert(mergedOut == "a\nb\n" || mergedOut == "b\na\n")
+    _ = merged.close()
+
+@test("closing a shell that is still running ends it, and the session goes on")
+closeShell()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val sh = made(s.shell())
+    made(sh.stdin("echo s\"\"tarted\n".utf8))
+    upTo(sh, "started\r\n")
+    assert(sh.close().isOk)
+    assertEq(made(s.run("echo next")).stdoutText, "next\n")
+
+@test("a terminal the server refuses is ChannelRefused, for a command and a shell, and the session goes on")
+ptyRefused()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    made(s.authKey(user, s"$dir/restricted"))
+    assert(failure(s.exec("tty", pty = Some(Pty()))) is ChannelRefused(_))
+    assert(failure(s.shell()) is ChannelRefused(_))
+    assertEq(made(s.run("tty")).stdoutText.trim, "not a tty")
+
+@test("a terminal type, size or mode that cannot be asked for is Invalid, and nothing is sent")
+invalidPty()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    assert(failure(s.exec("tty", pty = Some(Pty("")))) is Invalid(_))
+    assert(failure(s.exec("tty", pty = Some(Pty("x term")))) is Invalid(_))
+    assert(failure(s.exec("tty", pty = Some(Pty("xterm\u0000")))) is Invalid(_))
+    assert(failure(s.exec("tty", pty = Some(Pty(columns = 0)))) is Invalid(_))
+    assert(failure(s.exec("tty", pty = Some(Pty(rows = -1)))) is Invalid(_))
+    assert(failure(s.exec("tty", pty = Some(Pty(modes = [(0, 1)])))) is Invalid(_))
+    assert(failure(s.exec("tty", pty = Some(Pty(modes = [(160, 1)])))) is Invalid(_))
+    assert(failure(s.exec("tty", pty = Some(Pty(modes = [(TerminalMode.Echo, -1)])))) is Invalid(_))
+    assert(failure(s.shell(Some(Pty(columns = 0)))) is Invalid(_))
+    // The smallest terminal there is.
+    val tiny = made(s.exec("stty size", pty = Some(Pty(columns = 1, rows = 1))))
+    assert(upTo(tiny, "1 1").contains("1 1"))
+    _ = tiny.close()
+    assert(made(s.run("echo still")).success)
+
+@test("a resize of a command with no terminal, or to no size, is Invalid; of a closed one Closed")
+invalidResize()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val plain = made(s.exec("cat"))
+    assert(failure(plain.resize(80, 24)) is Invalid(_))
+    _ = plain.close()
+    val e = made(s.exec("cat", pty = Some(Pty())))
+    assert(failure(e.resize(0, 24)) is Invalid(_))
+    assert(failure(e.resize(80, 0)) is Invalid(_))
+    made(e.resize(1, 1))
+    _ = e.close()
+    assert(failure(e.resize(80, 24)) is dev.avinlang.ssh.Closed)
+
+@test("a terminal or a shell asked for before logging in is NotAuthenticated")
+ptyBeforeLogin()
+  if server() is Some((dir, port, user))
+    val s = connected(dir, port)
+    defer _ = s.close()
+    assert(failure(s.exec("tty", pty = Some(Pty()))) is NotAuthenticated)
+    assert(failure(s.shell()) is NotAuthenticated)
+    assert(failure(s.shell(pty = None)) is NotAuthenticated)

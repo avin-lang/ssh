@@ -2,6 +2,7 @@ module dev.avinlang.ssh
 
 // What a session and its commands share: the libssh2 session, its socket, the waits on it, and the
 // state that says whether it may still be used. Only this module sees it.
+import avin.net.ByteStream
 import avin.time.{Duration, monotonic}
 
 private class Link(
@@ -24,6 +25,8 @@ private class Link(
   // The SFTP subsystems open on the session, and the remote files open through them, closed before it.
   val sftps = Buffer[RawSftp]()
   val files = Buffer[RawSftpFile]()
+  // Those of `channels` that are tunnels rather than commands.
+  val tunnels = Buffer[RawChannel]()
   // The channels whose close is sent, waiting for the server's.
   val closing = Buffer[RawChannel]()
   // Whether the connection was cut, after which every libssh2 call fails at once.
@@ -169,12 +172,27 @@ private class Link(
           if code != eagain then return Err(failure(code, "open a channel"))
           await("open a channel")?
 
+  // A new `direct-tcpip` channel, to `host` at `port` as the server sees them.
+  tunnel(host: string, port: int) -> Result[RawChannel, SshError]
+    loop
+      raw.directTcpip(host, port, "127.0.0.1", 0) match
+        Some(ch) ->
+          tunnels.addOne(ch)
+          return Ok(ch)
+        None ->
+          val code = raw.lastErrno()
+          if code != eagain then return Err(failure(code, s"open a tunnel to $host:$port"))
+          await(s"open a tunnel to $host:$port")?
+
   // Closes `ch` the protocol's way, where the session can still talk, and gives it back; a command
   // whose output has not ended is sent `TERM` first, since a closed channel alone stops only a command
-  // that writes. The server's own close is not waited for (see `closeSent`).
+  // that writes. A tunnel runs no command, so it is only closed. The server's own close is not waited
+  // for (see `closeSent`).
   retire(ch: RawChannel)
+    val isTunnel = tunnels.exists(t -> t === ch)
+    if isTunnel then tunnels.filterInPlace(t -> t !== ch)
     if !interrupted && !waiting
-      if ch.atEof() == 0
+      if !isTunnel && ch.atEof() == 0
         _ = within("signal the command", options.closeTimeout, () -> ch.signal("TERM", 4))
       if !interrupted && !closeSent(ch) then return
     _ = ch.close()
@@ -271,6 +289,15 @@ private class Link(
       val ready = socket.wait(raw.blockDirections(), limit)
       waiting = false
       if ready then return Ok(())
+
+  // Waits, with no limit, until `local` can be read where `read` says, or written where `write` says,
+  // or the session's socket is ready as libssh2 last asked where `host` says: a relay's wait.
+  awaitWith(operation: string, local: ByteStream, read: bool, write: bool, host: bool) -> Result[unit, SshError]
+    val toHost = if !host then 0 elif raw.blockDirections() & blockOutbound != 0 then 2 else 1
+    waiting = true
+    socket.waitWith(local, read, write, toHost)
+    waiting = false
+    Ok(())
 
   // The error libssh2's `code` stands for, in its own words where it has them.
   failure(code: int, operation: string) -> SshError
