@@ -55,7 +55,13 @@ private knownName(host: string, port: int) -> string = if port == 22 then host e
 
 // Checks the key the server presented in the handshake of `raw` by `policy`, reading `path` where the
 // policy reads a file.
-private verifyHostKey(raw: RawSession, host: string, port: int, policy: HostKeys, path: string) -> Result[unit, SshError]
+private verifyHostKey(
+    raw: RawSession,
+    host: string,
+    port: int,
+    policy: HostKeys,
+    path: string
+) -> Result[unit, SshError]
   val (view, length, kind) = raw.hostKey()
   val key = view match
     Some(v) -> v.copy()
@@ -74,7 +80,12 @@ private verifyHostKey(raw: RawSession, host: string, port: int, policy: HostKeys
       val present = fs.exists(path)
       if present && list.readFile(path, knownHostFileOpenssh) < 0
         return Err(KnownHosts(path, "the file could not be read as an OpenSSH known-hosts file"))
-      val found = if present then list.check(host, port, key, knownHostTypePlain | knownHostKeyRaw | keyMask(kind)) else checkNotFound
+      val found = if present then list.check(
+        host,
+        port,
+        key,
+        knownHostTypePlain | knownHostKeyRaw | keyMask(kind)
+      ) else checkNotFound
       if found == checkMatch then return Ok(())
       if found == checkMismatch then return Err(ChangedHostKey(host, port, fingerprint))
       if found != checkNotFound then return Err(KnownHosts(path, "libssh2 could not check the host against it"))

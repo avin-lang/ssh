@@ -5,8 +5,10 @@ module tests
 // and the session closed under a command.
 import avin.threads.{sleep, withTimeout}
 import avin.time.{millis, monotonic, seconds}
+
 import dev.avinlang.ssh.{
-  Closed, Discard, Exited, Interrupted, Invalid, Merge, NotAuthenticated, Signalled, Stderr, Stdout, TimedOut, Options, Session
+  Closed, Discard, Exited, Interrupted, Invalid, Merge, NotAuthenticated, Signalled, Stderr, Stdout, TimedOut, Options,
+  Session
 }
 
 // Everything `e` prints, standard output and standard error apart, read to the end.

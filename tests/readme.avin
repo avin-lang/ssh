@@ -9,10 +9,10 @@ import avin.time.{millis, seconds}
 import dev.avinlang.ssh.{Exited, Local, Options, Pty, Session, Signalled, SshConfig, SshError, Stderr, Stdout}
 
 uname(
-  host: string,
-  user: string,
-  port: int = 22,
-  options: Options = Options(connectTimeout = Some(10.seconds))
+    host: string,
+    user: string,
+    port: int = 22,
+    options: Options = Options(connectTimeout = Some(10.seconds))
 ) -> Result[string, SshError] =
   val session = Session.connect(host, port, options)?
   defer _ = session.close()
@@ -33,11 +33,11 @@ follow(session: Session, command: string) -> Result[int, SshError] =
     Signalled(signal, _) -> Ok(128)
 
 onEach(
-  hosts: Vector[string],
-  user: string,
-  command: string,
-  port: int = 22,
-  options: Options = Options()
+    hosts: Vector[string],
+    user: string,
+    command: string,
+    port: int = 22,
+    options: Options = Options()
 ) -> Vector[(string, string)] =
   scope(sc ->
     val threads = hosts.map(host -> sc.spawn(() ->

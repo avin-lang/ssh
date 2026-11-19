@@ -8,6 +8,7 @@ import avin.io
 import avin.net.TcpListener
 import avin.threads.{scope, withTimeout}
 import avin.time.{millis, monotonic, seconds}
+
 import dev.avinlang.ssh.{
   AcceptNew, ChangedHostKey, Closed, Connect, Handshake, Options, Pinned, Session, SshError, Strict, UnexpectedHostKey,
   UnknownHostKey
@@ -115,7 +116,12 @@ acceptNew()
 acceptNewAfterUnendedLine()
   if server() is Some((dir, port, _))
     val path = s"$dir/unended_hosts"
-    made(fs.writeText(path, "[example.invalid]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl").mapErr(e -> fail(e.message)))
+    made(
+      fs.writeText(
+        path,
+        "[example.invalid]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+      ).mapErr(e -> fail(e.message))
+    )
     val s = made(Session.connect("127.0.0.1", port, Options(knownHosts = Some(path), hostKeys = AcceptNew)))
     _ = s.close()
     val lines = fs.readText(path).getOrElse("").split('\n')
@@ -127,7 +133,9 @@ acceptNewAfterUnendedLine()
 pinned()
   if server() is Some((dir, port, _))
     val fp = made(connected(dir, port).hostKeyFingerprint())
-    val s = made(Session.connect("127.0.0.1", port, Options(knownHosts = Some(s"$dir/no_such_file"), hostKeys = Pinned(fp))))
+    val s = made(
+      Session.connect("127.0.0.1", port, Options(knownHosts = Some(s"$dir/no_such_file"), hostKeys = Pinned(fp)))
+    )
     _ = s.close()
 
 @test("a pinned fingerprint that is not the server's is refused, naming both")

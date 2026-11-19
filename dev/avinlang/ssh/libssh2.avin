@@ -189,9 +189,9 @@ private val modeRegular: int
 // release then closes the descriptor. A descriptor it does not yet hold, before the handshake, is the
 // package's to close.
 @c(
-  type: "LIBSSH2_SESSION *",
-  holds: "int sock = -1",
-  release: "(sock >= 0 ? shutdown(sock, SHUT_RDWR) : 0, libssh2_session_set_blocking(self, 1), libssh2_session_free(self), sock >= 0 ? close(sock) : 0)"
+    type: "LIBSSH2_SESSION *",
+    holds: "int sock = -1",
+    release: "(sock >= 0 ? shutdown(sock, SHUT_RDWR) : 0, libssh2_session_set_blocking(self, 1), libssh2_session_free(self), sock >= 0 ? close(sock) : 0)"
 )
 private class RawSession
   @c("void libssh2_session_set_blocking(LIBSSH2_SESSION *self, int blocking)")
@@ -236,7 +236,13 @@ private class RawSession
   @c(
     "int libssh2_userauth_publickey_fromfile_ex(LIBSSH2_SESSION *self, const char *username, unsigned int username_len, const char *publickey, const char *privatekey, const char *passphrase)"
   )
-  authKeyFile(user: string, userLength: long, publicKey: Option[string], privateKey: string, passphrase: Option[string]) -> int
+  authKeyFile(
+      user: string,
+      userLength: long,
+      publicKey: Option[string],
+      privateKey: string,
+      passphrase: Option[string]
+  ) -> int
 
   @c(
     "int libssh2_userauth_password_ex(LIBSSH2_SESSION *self, const char *username, unsigned int username_len, const char *password, unsigned int password_len, null void (*passwd_change_cb)(LIBSSH2_SESSION *session, char **newpw, int *newpw_len, void **abstract))"
@@ -244,8 +250,8 @@ private class RawSession
   authPassword(user: string, userLength: long, password: string, passwordLength: long) -> int
 
   @c(
-    "LIBSSH2_CHANNEL *libssh2_channel_open_ex(LIBSSH2_SESSION *self, const char *channel_type, unsigned int channel_type_len, unsigned int window_size, unsigned int packet_size, null const char *message, unsigned int message_len)",
-    keeps: "self"
+      "LIBSSH2_CHANNEL *libssh2_channel_open_ex(LIBSSH2_SESSION *self, const char *channel_type, unsigned int channel_type_len, unsigned int window_size, unsigned int packet_size, null const char *message, unsigned int message_len)",
+      keeps: "self"
   )
   openChannel(kind: string, kindLength: long, window: long, packet: long, messageLength: long) -> Option[RawChannel]
 
@@ -262,8 +268,8 @@ private class RawSession
   // channel carries that connection's bytes. `shost` and `sport` say where the connection came from,
   // which the server only logs.
   @c(
-    "LIBSSH2_CHANNEL *libssh2_channel_direct_tcpip_ex(LIBSSH2_SESSION *self, const char *host, int port, const char *shost, int sport)",
-    keeps: "self"
+      "LIBSSH2_CHANNEL *libssh2_channel_direct_tcpip_ex(LIBSSH2_SESSION *self, const char *host, int port, const char *shost, int sport)",
+      keeps: "self"
   )
   directTcpip(host: string, port: int, shost: string, sport: int) -> Option[RawChannel]
 
@@ -295,15 +301,27 @@ private class RawChannel
   @c(
     "int libssh2_channel_request_pty_ex(LIBSSH2_CHANNEL *self, const char *term, unsigned int term_len, const char *modes, length(modes) unsigned int modes_len, int width, int height, int width_px, int height_px)"
   )
-  requestPty(term: string, termLength: long, modes: Array[byte], width: int, height: int, widthPx: int, heightPx: int) -> int
+  requestPty(
+      term: string,
+      termLength: long,
+      modes: Array[byte],
+      width: int,
+      height: int,
+      widthPx: int,
+      heightPx: int
+  ) -> int
 
-  @c("int libssh2_channel_request_pty_size_ex(LIBSSH2_CHANNEL *self, int width, int height, int width_px, int height_px)")
+  @c(
+    "int libssh2_channel_request_pty_size_ex(LIBSSH2_CHANNEL *self, int width, int height, int width_px, int height_px)"
+  )
   requestPtySize(width: int, height: int, widthPx: int, heightPx: int) -> int
 
   @c("ssize_t libssh2_channel_read_ex(LIBSSH2_CHANNEL *self, int stream_id, char *buf, length(buf) size_t buflen)")
   readInto(stream: int, buf: Array[byte]) -> long
 
-  @c("ssize_t libssh2_channel_write_ex(LIBSSH2_CHANNEL *self, int stream_id, const char *buf, length(buf) size_t buflen)")
+  @c(
+    "ssize_t libssh2_channel_write_ex(LIBSSH2_CHANNEL *self, int stream_id, const char *buf, length(buf) size_t buflen)"
+  )
   writeFrom(stream: int, buf: Array[byte]) -> long
 
   @c("int libssh2_channel_send_eof(LIBSSH2_CHANNEL *self)")
@@ -330,16 +348,16 @@ private class RawChannel
   exitStatus() -> int
 
   @c(
-    "int libssh2_channel_get_exit_signal(LIBSSH2_CHANNEL *self, out char **exitsignal, out size_t *exitsignal_len, out char **errmsg, out size_t *errmsg_len, null char **langtag, null size_t *langtag_len)",
-    free: ["exitsignal: libssh2_free(session, exitsignal)", "errmsg: libssh2_free(session, errmsg)"]
+      "int libssh2_channel_get_exit_signal(LIBSSH2_CHANNEL *self, out char **exitsignal, out size_t *exitsignal_len, out char **errmsg, out size_t *errmsg_len, null char **langtag, null size_t *langtag_len)",
+      free: ["exitsignal: libssh2_free(session, exitsignal)", "errmsg: libssh2_free(session, errmsg)"]
   )
   exitSignal() -> Result[(Option[string], long, Option[string], long), int]
 
 // The known hosts read from a file, to check a server's key against. Freed through its session.
 @c(
-  type: "LIBSSH2_KNOWNHOSTS *",
-  kept: "session: RawSession",
-  release: "session ? (libssh2_knownhost_free(self), 0) : 0"
+    type: "LIBSSH2_KNOWNHOSTS *",
+    kept: "session: RawSession",
+    release: "session ? (libssh2_knownhost_free(self), 0) : 0"
 )
 private class RawKnownHosts
   @c("int libssh2_knownhost_readfile(LIBSSH2_KNOWNHOSTS *self, const char *filename, int type)")
@@ -353,9 +371,9 @@ private class RawKnownHosts
 // A connection to an SSH agent, made through a session. Talking to the agent is a local socket's
 // round trip, so those calls are `blocking`.
 @c(
-  type: "LIBSSH2_AGENT *",
-  kept: "session: RawSession",
-  release: "session ? (libssh2_agent_disconnect(self), libssh2_agent_free(self), 0) : 0"
+    type: "LIBSSH2_AGENT *",
+    kept: "session: RawSession",
+    release: "session ? (libssh2_agent_disconnect(self), libssh2_agent_free(self), 0) : 0"
 )
 private class RawAgent
   @c("void libssh2_agent_set_identity_path(LIBSSH2_AGENT *self, const char *path)")
@@ -368,12 +386,15 @@ private class RawAgent
   listIdentities() -> int
 
   @c(
-    "int libssh2_agent_get_identity(LIBSSH2_AGENT *self, out struct libssh2_agent_publickey **store, struct libssh2_agent_publickey *prev)",
-    keeps: "self"
+      "int libssh2_agent_get_identity(LIBSSH2_AGENT *self, out struct libssh2_agent_publickey **store, struct libssh2_agent_publickey *prev)",
+      keeps: "self"
   )
   identity(prev: Option[AgentKey]) -> (int, Option[AgentKey])
 
-  @c("int libssh2_agent_userauth(LIBSSH2_AGENT *self, const char *username, struct libssh2_agent_publickey *identity)", blocking)
+  @c(
+    "int libssh2_agent_userauth(LIBSSH2_AGENT *self, const char *username, struct libssh2_agent_publickey *identity)",
+    blocking
+  )
   userauth(user: string, key: AgentKey) -> int
 
 // One key an agent holds, which belongs to the agent's list of them and is freed with it, so giving
@@ -399,8 +420,8 @@ private class RawSftp
   lastError() -> long
 
   @c(
-    "LIBSSH2_SFTP_HANDLE *libssh2_sftp_open_ex(LIBSSH2_SFTP *self, const char *filename, unsigned int filename_len, unsigned long flags, long mode, int open_type)",
-    keeps: "self"
+      "LIBSSH2_SFTP_HANDLE *libssh2_sftp_open_ex(LIBSSH2_SFTP *self, const char *filename, unsigned int filename_len, unsigned long flags, long mode, int open_type)",
+      keeps: "self"
   )
   open(path: string, pathLength: long, flags: long, mode: long, openType: int) -> Option[RawSftpFile]
 

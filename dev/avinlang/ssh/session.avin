@@ -258,7 +258,13 @@ object Session
 // A session over a TCP connection to `tcpHost` at `tcpPort`, its host key checked as that of `host` at
 // `port`: the same where the connection goes straight to the server, a local end of a tunnel where it
 // goes through a jump host.
-private connectThrough(tcpHost: string, tcpPort: int, host: string, port: int, options: Options) -> Result[Session, SshError]
+private connectThrough(
+    tcpHost: string,
+    tcpPort: int,
+    host: string,
+    port: int,
+    options: Options
+) -> Result[Session, SshError]
   val init = ready()
   if init != 0 then return Err(Failed(init, "libssh2 could not be initialized"))
   options.connectTimeout match

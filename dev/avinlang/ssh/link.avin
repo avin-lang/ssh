@@ -90,7 +90,11 @@ private class Link(
     channels.clear()
     for ch in open do retire(ch)
     if !interrupted && holdsSocket
-      _ = within("disconnect", options.closeTimeout, () -> raw.disconnect(disconnectByApplication, "closed by the client", ""))
+      _ = within(
+        "disconnect",
+        options.closeTimeout,
+        () -> raw.disconnect(disconnectByApplication, "closed by the client", "")
+      )
     if files.nonEmpty || closing.nonEmpty
       cutConnection()
       for f in files.toArray()

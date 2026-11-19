@@ -3,10 +3,11 @@ module tests
 // The errors: each case's sentence, what it says it was caused by, and which are safe to retry.
 import avin.io
 import avin.io.IoError
+
 import dev.avinlang.ssh.{
   Agent, AuthFailed, ChangedHostKey, ChannelRefused, Closed, Connect, Disconnected, Exited, Failed, Handshake,
-  Interrupted, Invalid, KeyFile, KnownHosts, Local, NotAuthenticated, Output, SftpFailed, Signalled, SshError,
-  TimedOut, UnexpectedHostKey, UnknownHostKey
+  Interrupted, Invalid, KeyFile, KnownHosts, Local, NotAuthenticated, Output, SftpFailed, Signalled, SshError, TimedOut,
+  UnexpectedHostKey, UnknownHostKey
 }
 
 @test("each error says what went wrong in a sentence of its own")
@@ -63,8 +64,16 @@ retry()
   assert(Handshake("x").safeToRetry)
   assert(ChannelRefused("x").safeToRetry)
   val never: Vector[SshError] = [
-    UnknownHostKey("h", 22, "f"), ChangedHostKey("h", 22, "f"), AuthFailed("password", []), TimedOut("x"),
-    Disconnected("x"), Closed, Interrupted, Failed(-1, "x"), NotAuthenticated, SftpFailed("/x", 2, "x"),
+    UnknownHostKey("h", 22, "f"),
+    ChangedHostKey("h", 22, "f"),
+    AuthFailed("password", []),
+    TimedOut("x"),
+    Disconnected("x"),
+    Closed,
+    Interrupted,
+    Failed(-1, "x"),
+    NotAuthenticated,
+    SftpFailed("/x", 2, "x"),
     Local(IoError(io.Other("x"), "read", "y"))
   ]
   for e in never do assert(!e.safeToRetry)
