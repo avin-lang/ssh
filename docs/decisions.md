@@ -220,3 +220,22 @@ when it is read, nested as blocks so a `Host` inside an included file ends at th
 *Alternatives*: refusing `ProxyJump` (fettle's jump hosts need it); libssh2's send and receive
 callbacks pointed at the jump channel (C callbacks into Avin code from inside libssh2, with no way to
 park the thread).
+
+## `wait` waits for the server's close before sending its own
+
+(Settled on the user's delegation 2026-11-20, branch `exec-close`.) A command has ended when the
+server closes its channel, which the server does after `exit-status` or `exit-signal` (RFC 4254
+§6.10); the end of its output (`EOF`, §5.3) says only that no more output comes. On Linux a command
+on a terminal that closes its own descriptors of it and goes on running (`sudo` under `use_pty`) ends
+the output at once, and `wait` closed the channel then: OpenSSH took that close as the client hanging
+up, closed the terminal, and the command died of `HUP`. `wait` now reads the output to its end, waits
+for the server's close, and answers it with its own. The wait is bounded as every wait of the session
+is: by its `timeout`, after which it is `TimedOut` and the session `Interrupted`, and by a deadline
+of the caller's. With no `timeout` and no deadline, a server that never closes holds `wait` as it
+would hold `next`, as OpenSSH's own client waits. *Alternatives*: closing once `exit-status` has
+arrived plus a grace of `closeTimeout` (libssh2 answers `0` both for an exit status of `0` and for
+none, so the arrival of a successful one cannot be seen); a fixed limit from the end of the output (it
+would hang up exactly the long-running commands this fixes). A server that closes without saying how
+the command ended reads as `Exited(0)`, which is what libssh2 answers; no OpenSSH server does that.
+**Review with the user**: whether `wait` should take a limit of its own, apart from the session's
+`timeout`.

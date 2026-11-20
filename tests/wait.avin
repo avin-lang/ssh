@@ -1,0 +1,128 @@
+module tests
+
+// How `wait` ends a command: it waits for the server's close, which follows the exit status, rather
+// than closing first, so a command whose output ends before it does, on a terminal or not, is not
+// hung up; the session's timeout and a deadline still bound the wait; and a second `wait` answers
+// the same.
+import avin.threads.withTimeout
+import avin.time.{millis, monotonic, seconds}
+
+import dev.avinlang.ssh.{Exited, Interrupted, Pty, Session, Signalled, TimedOut}
+
+// A command that closes its output, then goes on running for a second before it exits with 3. It
+// runs under `sh`, which holds no descriptor of the terminal of its own once its own are redirected,
+// so the terminal's output ends while it runs.
+private val outlivesOutput = "exec sh -c 'exec >/dev/null 2>&1 </dev/null; sleep 1; exit 3'"
+
+@test("a command on a terminal that closes its output and goes on running exits with its own status")
+terminalOutlivesOutput()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = made(s.exec(outlivesOutput, pty = Some(Pty())))
+    val began = monotonic()
+    assert(made(e.wait()) is Exited(3))
+    assert(monotonic() - began >= millis(800))
+    val closing = monotonic()
+    assert(e.close().isOk)
+    assert(monotonic() - closing < seconds(2))
+    assertEq(made(s.run("echo next")).stdoutText, "next\n")
+
+@test("output read to its end before wait, on a terminal, leaves the exit status to wait for")
+terminalDrainedThenWait()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = made(
+      s.exec("echo before; exec sh -c 'exec >/dev/null 2>&1 </dev/null; sleep 1; exit 3'", pty = Some(Pty()))
+    )
+    defer _ = e.close()
+    val (out, _) = allOf(e)
+    assert(out.contains("before"))
+    assert(made(e.wait()) is Exited(3))
+
+@test("a command without a terminal that closes its output and goes on running exits with its own status")
+plainOutlivesOutput()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = made(s.exec(outlivesOutput))
+    defer _ = e.close()
+    assert(made(e.wait()) is Exited(3))
+    assert(made(s.run(outlivesOutput)).status is Exited(3))
+
+@test("output that goes on after standard input ends is read, and the status follows it")
+outputAfterStdinEnds()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = made(s.exec("cat; sleep 0.3; echo after; exit 6"))
+    defer _ = e.close()
+    made(e.stdin("typed\n".utf8))
+    made(e.closeStdin())
+    assertEq(drained(e), ("typed\nafter\n", ""))
+    assert(made(e.wait()) is Exited(6))
+
+@test("a command a signal ends after closing its output is Signalled, on a terminal or not")
+signalledAfterOutput()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val command = "exec sh -c 'exec >/dev/null 2>&1 </dev/null; sleep 0.5; kill -KILL $$'"
+    for pty in [Some(Pty()), None]
+      val e = made(s.exec(command, pty = pty))
+      made(e.wait()) match
+        Signalled(name, _) -> assertEq(name, "KILL")
+        other -> fail(s"expected Signalled, got $other")
+      _ = e.close()
+
+@test("a command that exits at once, its status then the close coming together, answers at once")
+statusThenClose()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    for pty in [Some(Pty()), None]
+      val e = made(s.exec("echo done; exit 9", pty = pty))
+      val began = monotonic()
+      assert(made(e.wait()) is Exited(9))
+      assert(monotonic() - began < seconds(2))
+      _ = e.close()
+
+@test("the session's timeout bounds a wait for a server that does not close, leaving it Interrupted")
+closeNeverComes()
+  if server() is Some((dir, port, user))
+    val s = made(Session.connect("127.0.0.1", port, testOptions(dir) with {timeout = Some(millis(500))}))
+    made(s.authKey(user, s"$dir/client"))
+    val e = made(s.exec("exec sh -c 'exec >/dev/null 2>&1 </dev/null; sleep 20'", pty = Some(Pty())))
+    val began = monotonic()
+    assert(failure(e.wait()) is TimedOut(_))
+    assert(monotonic() - began < seconds(5))
+    assert(!s.isOpen)
+    assert(failure(s.run("true")) is Interrupted)
+    assert(s.close().isOk)
+
+@test("a deadline bounds a wait for a server that does not close")
+deadlineWhileWaitingForClose()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    val e = made(s.exec("exec sh -c 'exec >/dev/null 2>&1 </dev/null; sleep 20'", pty = Some(Pty())))
+    val began = monotonic()
+    assertEq(withTimeout(millis(500), _ -> e.wait().isOk), None)
+    assert(monotonic() - began < seconds(3))
+    assert(!s.isOpen)
+    val closing = monotonic()
+    assert(s.close().isOk)
+    assert(monotonic() - closing < seconds(2))
+
+@test("wait asked twice, and next after it, answer the same once the command outlived its output")
+waitTwiceAfterOutput()
+  if server() is Some((dir, port, user))
+    val s = loggedIn(dir, port, user)
+    defer _ = s.close()
+    val e = made(s.exec(outlivesOutput, pty = Some(Pty())))
+    defer _ = e.close()
+    assert(made(e.wait()) is Exited(3))
+    val again = monotonic()
+    assert(made(e.wait()) is Exited(3))
+    assert(monotonic() - again < millis(100))
+    assert(made(e.next()).isEmpty)

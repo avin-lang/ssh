@@ -24,7 +24,7 @@ Name it in your package's `avin.hocon`:
 
 ```hocon
 dependencies {
-  ssh { git = "github.com/avin-lang/ssh", version = "0.0.1" }
+  ssh { git = "github.com/avin-lang/ssh", version = "0.0.2" }
 }
 ```
 

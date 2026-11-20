@@ -124,8 +124,14 @@ class Exec(
     inputClosed = true
     Ok(())
 
-  // Reads the command's output to its end, dropping it, and answers how the command ended. Asked
-  // again, answers the same.
+  // Reads the command's output to its end, dropping it, waits for the command to end, and answers how
+  // it ended. Asked again, answers the same.
+  //
+  // The command has ended when the server closes the channel, which it does after saying how the
+  // command ended. Its output can end sooner: a command on a terminal that closes its own descriptors
+  // of it and goes on running, as `sudo` does. `wait` closes the channel only after the server has,
+  // since a close sent first would hang the command up. Each wait for the server is bounded by the
+  // session's `timeout`, as every other is, and by a deadline the caller sets.
   wait() -> Result[ExitStatus, SshError]
     status match
       Some(s) -> return Ok(s)
@@ -136,10 +142,10 @@ class Exec(
         Some(_) -> ()
         None -> break
     if !channelClosed
+      val closedRc = link.retrying("wait for the command to end", () -> raw.waitClosed())?
+      if closedRc < 0 then return Err(link.failure(closedRc, "wait for the command to end"))
       val sent = link.retrying("close the channel", () -> raw.sendClose())?
       if sent < 0 then return Err(link.failure(sent, "close the channel"))
-      val closedRc = link.retrying("close the channel", () -> raw.waitClosed())?
-      if closedRc < 0 then return Err(link.failure(closedRc, "close the channel"))
       channelClosed = true
     val ended = raw.exitSignal() match
       Ok((Some(signal), _, message, _)) -> Signalled(signal, message.getOrElse(""))
