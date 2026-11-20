@@ -141,8 +141,22 @@ session's whole timeout. `exec`, `run` and `sftp` check `libssh2_userauth_authen
 A connection reset before the server's banner arrived (a listening queue overflowing drops
 connections that way) failed as `Disconnected`, which is not safe to retry, though nothing but the
 connection had reached the server. Every failure inside the handshake but a timeout is now
-`Handshake(reason)`, the reason keeping libssh2's words. The 200-session test retries such failures
-as a fan-out would: two hundred connections at once to one `sshd` overflow its listen queue of 128.
+`Handshake(reason)`, the reason keeping libssh2's words.
+
+## Connections to one server are bounded by the program, not by the package
+
+(Settled on the user's delegation 2026-11-20, branch `many-flake`.) The kernel resets a connection
+that finds the server's listening queue full, at `connect` or before the banner; `sshd` asks for a
+queue of 128 and macOS caps every queue at `kern.ipc.somaxconn`, 128 by default. Two hundred
+sessions connecting at once to an `sshd` on the same Mac met about 180 resets a run, and the
+200-session test, which retried them five times with a short backoff, failed whenever one connection
+was reset six times. The test now connects at most 64 at a time through a `Semaphore`, with no
+retry, and still holds all 200 sessions open at once; the README shows the bound. *Alternatives*: a
+limiter inside `Session.connect`, per host and port (every fan-out would be safe unasked, but the
+right bound is the server's queue, which the client cannot see, and a process-wide limit would slow
+programs whose servers take more); more retries with a longer backoff (passes more often, and still
+depends on how fast `sshd` forks). **Review with the user**: whether `Options` should carry such a
+limit.
 
 ## The session and its commands share a module-private `Link`
 

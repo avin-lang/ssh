@@ -2,49 +2,53 @@ module tests
 
 // Many sessions at once on lightweight threads, one each, against the one server; sessions nobody
 // closed, given back by the collector; and a session's ownership, which belongs to one thread.
-import avin.threads.{Mutex, scope, sleep}
-import avin.time.{millis, monotonic, seconds}
+import avin.threads.{Semaphore, WaitGroup, scope}
+import avin.time.{monotonic, seconds}
 import dev.avinlang.ssh.Session
 
-// How many connections were tried again.
-private val retried: Mutex[int] = Mutex(0)
+// How many sessions may be connecting at once. A connection the server has not accepted yet waits in
+// its listening socket's queue, which holds 128 on macOS (sshd asks for 128, and `kern.ipc.somaxconn`
+// caps every queue there at 128 by default); the kernel resets a connection that finds it full, at
+// `connect` or before the server's banner. Two hundred connections at once overflow it, about 180
+// resets a run here, while `sshd` forks a process for each connection it accepts. Sixty-four keeps the
+// queue at most half full, whatever the server's pace, so no connection here is reset, and none is
+// tried again: a reset fails the test.
+private val connecting = Semaphore(64)
 
-// A session with the server, tried again, as a fan-out does, while the failure is safe to retry: two
-// hundred connections at once overflow the listening socket's queue of 128 here, and the kernel resets
-// a connection it dropped from it, which the client sees as a handshake that failed.
-private connectRetrying(dir: string, port: int) -> Result[Session, dev.avinlang.ssh.SshError]
-  var attempt = 0
-  loop
-    val r = Session.connect("127.0.0.1", port, testOptions(dir))
-    if r.isOk || attempt == 5 || !r.err.exists(e -> e.safeToRetry) then return r
-    attempt += 1
-    _ = retried.update((n: int) -> n + 1)
-    sleep(millis(long(20 * attempt)))
-
-// What one thread does: connects, logs in, runs a command and closes, answering what the command
-// printed or what failed.
-private oneSession(dir: string, port: int, user: string, i: int) -> string
-  connectRetrying(dir, port) match
+// What one thread does: connects (holding one of `connecting`'s permits), logs in, counts itself in
+// `open` and waits there until all two hundred are logged in at once, runs a command and closes,
+// answering what the command printed or what failed. A thread that fails counts itself in too, so
+// that the others do not wait for it.
+private oneSession(dir: string, port: int, user: string, i: int, open: WaitGroup) -> string
+  var counted = false
+  defer
+    if !counted then open.done()
+  connecting.withPermit(() -> Session.connect("127.0.0.1", port, testOptions(dir))) match
     Err(e) -> s"connect: ${e.message}"
     Ok(s) ->
       defer _ = s.close()
       s.authKey(user, s"$dir/client") match
         Err(e) -> s"auth: ${e.message}"
         Ok(_) ->
+          counted = true
+          open.done()
+          if !open.waitFor(seconds(60)) then return "not every session logged in"
           s.run(s"echo $i") match
             Ok(o) -> o.stdoutText.trim
             Err(e) -> s"run: ${e.message}"
 
-@test("two hundred sessions run at once on lightweight threads, each its own command")
+@test("two hundred sessions are open at once on lightweight threads, each running its own command")
 twoHundred()
   if server() is Some((dir, port, user))
     val began = monotonic()
+    val open = WaitGroup()
+    open.add(200)
     val answers = scope(sc ->
-      val threads = (0 ..< 200).map(i -> sc.spawn(() -> oneSession(dir, port, user, i)))
+      val threads = (0 ..< 200).map(i -> sc.spawn(() -> oneSession(dir, port, user, i, open)))
       threads.map(t -> t.join()))
     val took = monotonic() - began
     for i in 0 ..< 200 do assertEq(answers(i), s"$i")
-    println(s"200 sessions took $took, ${retried.get()} connections tried again")
+    println(s"200 sessions took $took")
     assert(took < seconds(120))
 
 @test("sessions and commands nobody closed are given back by the collector, commands first")

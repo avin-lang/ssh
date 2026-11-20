@@ -214,6 +214,18 @@ use a session, and using either from another thread traps. A wait that a timeout
 cuts off leaves the protocol half way through something, so the session then answers `Interrupted`
 until it is closed.
 
+Many sessions with one server are opened a bounded number at a time. A connection the server has not
+accepted yet waits in its listening socket's queue, and the kernel resets one that finds the queue
+full: OpenSSH's `sshd` asks for 128, and macOS caps every queue at `kern.ipc.somaxconn`, 128 by
+default. Two hundred connections at once to an `sshd` on the same Mac see well over a hundred
+resets, as `Connect` or `Handshake` errors. Taking a `Semaphore` permit around `Session.connect`
+alone keeps the sessions themselves all open at once:
+
+```avin
+val connecting = Semaphore(64)
+val s = connecting.withPermit(() -> Session.connect(host))?
+```
+
 ## Testing
 
 The tests run against a private, unprivileged `sshd` of their own, on 127.0.0.1 port 22220, with its
